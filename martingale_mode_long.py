@@ -13,6 +13,7 @@ from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
 from logger import setup_logger
 from api.client import BackpackAPIClient
+from api.client import get_market_limits, get_ticker
 
 logger = setup_logger("martingale_long")
 
@@ -1197,11 +1198,11 @@ class MartingaleLongTrader:
                 # 強化處理：根據交易所要求截斷小數位
                 quantity_str = format(quantity, f".{self.base_precision}f")
                 quantity = float(quantity_str)
-
-                if quantity < self.min_order_size:
-                    logger.warning(f"層級{layer}訂單量{quantity}低於最小值，跳過")
-                    continue
-
+                if isinstance(quantity, float):
+                    quantity_str = f"{quantity:.{self.base_precision}f}"
+                else:
+                    quantity_str = str(quantity)
+                
                 orders.append(('Bid', target_price, quantity))
 
             # 執行下單
