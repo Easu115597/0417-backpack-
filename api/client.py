@@ -390,6 +390,7 @@ def get_ticker(symbol: str) -> float:
         response.raise_for_status()
         ticker_data = response.json()
         logger.info(f"📊 取得報價: {ticker_data}")
+        logger.info(f"🔧 lastPrice 型別: {type(price)}, 值: {price}")
 
         return float(ticker_data.get('lastPrice', 0))
     
