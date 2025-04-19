@@ -63,7 +63,7 @@ def parse_arguments():
     martingale_group.add_argument('--max-layers', dest='max_layers', type=int, default=5, help='最大加倉層數')
     parser.add_argument('--multiplier', type=float, default=1.3, help='馬丁加碼倍率')
     parser.add_argument('--use_market_order', action='store_true', help='是否使用市價初始下單')
-    parser.add_argument('--entry-price', type=float, help='指定首次入場目標價格')
+    parser.add_argument('--entry-price', type=float,default=None, help='指定首次入場目標價格')
 
     return parser.parse_args()
 
@@ -117,7 +117,7 @@ def main():
                 max_layers=args.max_layers,
                 martingale_multiplier=args.multiplier,
                 use_market_order=args.use_market_order,
-                target_price=args.entry_price,
+                entry_price=args.entry_price,
                 duration=args.duration,
             )
             trader.run()
