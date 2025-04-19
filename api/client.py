@@ -532,7 +532,7 @@ def submit_order(order_details: dict) -> dict:
         method = "POST"
         path = "/api/v1/order"
         body = json.dumps(payload)
-        signature = generate_signature(API_SECRET, timestamp, method, path, body)
+        signature = create_signature(API_SECRET, timestamp, method, request_path, body)
 
         headers = {
             "Content-Type": "application/json",
