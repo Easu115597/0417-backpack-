@@ -389,17 +389,11 @@ def get_ticker(symbol: str) -> float:
         response = requests.get(f"{BASE_URL}{endpoint}")
         response.raise_for_status()
         ticker_data = response.json()
+        price = float(ticker_data.get('lastPrice', 0))
         logger.info(f"📊 取得報價: {ticker_data}")
         logger.info(f"🔧 lastPrice 型別: {type(price)}, 值: {price}")
 
-        return float(ticker_data.get('lastPrice', 0))
-    
-        tickers = res.json()
-        for ticker in tickers:
-            if ticker.get("market", "").upper() == symbol:
-                return float(ticker["price"])
-        logger.error(f"❌ 未找到價格資訊: {symbol}")
-        return 0.0
+        return price
     except Exception as e:
         logger.error(f"獲取價格失敗: {e}")
         return 0.0
