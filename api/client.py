@@ -473,6 +473,37 @@ def get_market_limits(symbol: str) -> dict:
         logger.error(f"❌ 市場限制查詢異常: {e}")
         return {}
 
+def submit_order(order_details: dict) -> dict:
+    try:
+        symbol = order_details["symbol"]
+        side = order_details["side"]
+        is_market = order_details.get("use_market_order", False)
+        quantity = order_details.get("quantity", None)
+        quote_quantity = order_details.get("quoteQuantity", None)
 
+        payload = {
+            "symbol": symbol,
+            "side": side,
+            "type": "market" if is_market else "limit"
+        }
+
+        if is_market:
+            if quote_quantity is None:
+                raise ValueError("市價單需提供 quoteQuantity")
+            payload["quoteQuantity"] = str(quote_quantity)
+        else:
+            if quantity is None:
+                raise ValueError("限價單需提供 quantity")
+            payload["quantity"] = str(quantity)
+            payload["price"] = str(order_details.get("price"))
+
+        logger.info(f"📤 提交訂單 API Payload: {payload}")
+        response = requests.post(f"{BASE_URL}/api/v1/order", headers=HEADERS, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    except Exception as e:
+        logger.error(f"订单执行失败: {e}")
+        return None
 # 在api/client.py中確保全局實例
 client = BackpackAPIClient()  # 模塊級別單例
