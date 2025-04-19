@@ -381,12 +381,18 @@ def cancel_order(api_key, secret_key, order_id, symbol):
 def get_ticker(symbol: str) -> float:
     try:
         symbol = symbol.replace('-', '_').upper()  # ✅ 自動格式轉換
-        url = f"{BASE_URL}/api/v1/market/ticker?symbol={symbol}"
+        url = f"{BASE_URL}/api/v1/spot/tickers"  # ✅ 請求全部 ticker
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
-        last_price = data.get("lastPrice")
-        return float(last_price) if last_price else 0.0
+        tickers = response.json()
+        
+        for t in tickers:
+            if t.get("symbol") == symbol:
+                return float(t.get("price"))
+
+        logger.error(f"找不到 {symbol} 的價格")
+        return 0.0
     except Exception as e:
         logger.error(f"獲取價格失敗: {e}")
         return 0.0
