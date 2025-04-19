@@ -387,8 +387,9 @@ def get_ticker(symbol: str) -> float:
         symbol = symbol.replace('-', '_').upper()  # ✅ 自動格式轉換
         endpoint = f"/api/v1/ticker?symbol={symbol}"  # ✅ 請求全部 ticker
         response = requests.get(f"{BASE_URL}{endpoint}")
-        return float(response.json()['close'])
         response.raise_for_status()
+        ticker_data = response.json()
+        return float(ticker_data.get('lastPrice', 0))
         tickers = res.json()
         for ticker in tickers:
             if ticker.get("market", "").upper() == symbol:
