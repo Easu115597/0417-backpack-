@@ -389,7 +389,10 @@ def get_ticker(symbol: str) -> float:
         response = requests.get(f"{BASE_URL}{endpoint}")
         response.raise_for_status()
         ticker_data = response.json()
+        logger.info(f"📊 取得報價: {ticker_data}")
+
         return float(ticker_data.get('lastPrice', 0))
+    
         tickers = res.json()
         for ticker in tickers:
             if ticker.get("market", "").upper() == symbol:
