@@ -1,10 +1,8 @@
-# Backpack Exchange 做市交易程序
+# Backpack Exchange 馬丁交易程序
 
 這是一個針對 Backpack Exchange 的加密貨幣做市交易程序。該程序提供自動化做市功能，通過維持買賣價差賺取利潤。
 
-Backpack 註冊連結：[https://backpack.exchange/refer/yan](https://backpack.exchange/refer/yan)
 
-Twitter：[Yan Practice ⭕散修](https://x.com/practice_y11)
 
 ## 功能特點
 
@@ -55,6 +53,24 @@ lemon_trader/
 ├── run.py                # 統一入口文件
 └── README.md             # 說明文檔
 ```
+
+馬丁程式的主要模組及其關係的簡要流程圖
+run.py
+├── 初始化策略參數
+├── 建立 WebSocket 連線
+├── 進行時間同步
+├── 初始化資料庫
+├── 啟動策略執行
+│   └── MartingaleStrategy.run()
+│       ├── cancel_existing_orders()
+│       ├── get_market_price()
+│       ├── place_martingale_orders()
+│       │   └── execute_order()
+│       ├── check_order_fills()
+│       └── close_all_positions()
+
+在 run.py 中，程式初始化各項設定後，呼叫 MartingaleStrategy 類別的 run() 方法。​在 run() 方法中，依序執行取消現有訂單、取得市場價格、下馬丁格爾訂單、檢查訂單成交情況，最後在需要時關閉所有持倉。
+
 
 ## 環境要求
 
