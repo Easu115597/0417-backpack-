@@ -42,7 +42,7 @@ class MartingaleLongTrader:
     ):
         self.api_key = api_key
         self.secret_key = secret_key
-        self.symbol = symbol.upper()
+        self.symbol = symbol.upper().replace('-', '_')
         self.total_capital = total_capital_usdt
         self.price_step_down = price_step_down
         self.take_profit_pct = take_profit_pct
@@ -1217,7 +1217,10 @@ class MartingaleLongTrader:
                 order_details = {
                    "symbol": self.symbol.replace("_", "-"),
                     "side": "Bid",
-                    "use_market_order": self.use_market_order
+                    "orderType": "Market",
+                    "quoteQuantity": str(allocated_funds[layer]),  # 使用报价资产数量
+                    "timeInForce": "IOC"
+
                 }
 
                 if self.use_market_order:
