@@ -1223,11 +1223,22 @@ class MartingaleLongTrader:
             # 執行下單
             for side, price, quantity in orders:
                 order_details = {
-                    "symbol": self.symbol,
-                    "side": side,
-                    'quantity': quantity,
+                    "symbol": self.symbol.replace("_", "-"),
+                    "side": "Bid",
+                    
                     'use_market_order': self.use_market_order,
                 }
+
+                if self.use_market_order:
+                   order_details["quoteQuantity"] = allocated_funds[layer]
+                else:
+                    size = round(allocated_funds[layer] / entry_price, self.base_precision)
+                    order_details["quantity"] = size
+                    order_details["price"] = round(entry_price, self.quote_precision)
+                logger.info(f"📤 提交訂單: {order_details}")
+                submit_order(order_details)
+
+
                 logger.info(f"📤 提交訂單: {order_details}")
 
                 result = self.client.execute_order(order_details)
