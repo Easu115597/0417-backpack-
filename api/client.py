@@ -6,8 +6,11 @@ import time
 import requests
 import os
 import base64
-import requests
 import logging
+import hmac
+import hashlib
+import time
+import base64
 from typing import Dict, Any, Optional, List, Union
 from .auth import create_signature
 from config import API_URL, API_VERSION, DEFAULT_WINDOW
@@ -22,10 +25,6 @@ logger = setup_logger("api.client")
 BASE_URL = "https://api.backpack.exchange"
 logger = logging.getLogger(__name__)
 
-HEADERS = {
-    "Content-Type": "application/json",
-    "X-BACKPACK-APIKEY": API_KEY
-}
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -54,6 +53,11 @@ class BackpackAPIClient:
         except Exception as e:
             logger.error(f"時間同步異常: {str(e)}")
             self.time_offset = 0  # 降級使用本地時間
+    
+    def generate_signature(secret, timestamp, method, request_path, body=''):
+        message = f'{timestamp}{method.upper()}{request_path}{body}'
+        signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).digest()
+        return base64.b64encode(signature).decode()
 
     def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> list:
         """獲取K線數據（支持多時間週期）"""
@@ -200,6 +204,18 @@ class BackpackAPIClient:
         
     def execute_order(self, order_details: dict) -> dict:
         """执行订单"""
+        order_details['symbol'] = order_details['symbol'].replace('-', '_').upper()
+
+        # 市價單必須包含quoteQuantity或quantity，但不能同時存在
+        if order_details.get('orderType') == 'Market':
+            if 'quantity' in order_details and 'quoteQuantity' in order_details:
+                order_details.pop('quantity')  # 優先使用quoteQuantity
+    
+        # 添加調試日誌
+        logger.debug(f"提交訂單參數: {json.dumps(order_details, indent=2)}")
+
+
+
         endpoint = f"/api/{API_VERSION}/order"
         try:
             headers = self._generate_headers("orderExecute", order_details)
@@ -510,6 +526,20 @@ def submit_order(order_details: dict) -> dict:
                 raise ValueError("限價單需提供 quantity")
             payload["quantity"] = str(quantity)
             payload["price"] = str(order_details.get("price"))
+
+         # 🔐 產生簽名與 headers
+        timestamp = str(int(time.time() * 1000))
+        method = "POST"
+        path = "/api/v1/order"
+        body = json.dumps(payload)
+        signature = generate_signature(API_SECRET, timestamp, method, path, body)
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-BP-API-KEY": API_KEY,
+            "X-BP-TIMESTAMP": timestamp,
+            "X-BP-API-SIGNATURE": signature,
+        }
 
         logger.info(f"📤 提交訂單 API Payload: {payload}")
         response = requests.post(f"{BASE_URL}/api/v1/order", headers=HEADERS, json=payload)
