@@ -65,12 +65,33 @@ run.py
 │       ├── cancel_existing_orders()
 │       ├── get_market_price()
 │       ├── place_martingale_orders()
+│       │   ├──資金分配 + 計算 size
+│       │   ├── submit_order()             ← 呼叫 API 下單
 │       │   └── execute_order()
-│       ├── check_order_fills()
-│       └── close_all_positions()
+│       ├── 每隔 interval:
+│       │   ├──check_order_fills()
+│       │   ├──check_take_profit() / check_stop_loss()
+│       │   └── 如果觸發 close_all_positions()
 
-在 run.py 中，程式初始化各項設定後，呼叫 MartingaleStrategy 類別的 run() 方法。​在 run() 方法中，依序執行取消現有訂單、取得市場價格、下馬丁格爾訂單、檢查訂單成交情況，最後在需要時關閉所有持倉。
+在 run.py 中，程式初始化各項設定後，呼叫 MartingaleStrategy 類別的 run() 方法。
+​在 run() 方法中，依序執行取消現有訂單、取得市場價格、下馬丁格爾訂單、檢查訂單成交情況，最後在需要時關閉所有持倉。
 ```
+
+
+martingale_mode_long.py 主要邏輯檢視
+在 martingale_mode_long.py 中，MartingaleStrategy 類別的主要方法如下：​
+GitHub
+
+place_martingale_orders()：​計算每一層的訂單價格與數量，然後呼叫 execute_order() 來下單。​
+
+execute_order()：​執行實際的下單操作，與交易所 API 互動。​
+
+cancel_existing_orders()：​取消所有未成交的訂單，避免重複下單或訂單堆積。​
+
+check_order_fills()：​檢查已下訂單的成交情況，更新策略狀態。​
+
+close_all_positions()：​在策略終止時，平倉所有持倉，確保資金安全。
+
 
 ## 環境要求
 
