@@ -3,6 +3,7 @@
 """
 import time
 import threading
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Union, Any
 from concurrent.futures import ThreadPoolExecutor
@@ -832,18 +833,32 @@ class MartingaleLongTrader:
         """獲取當前價格（優先使用WebSocket數據）"""
         self.check_ws_connection()
         price = None
+
+        # 優先從 WebSocket 拿價格
         if self.ws and self.ws.connected:
             price = self.ws.get_current_price()
+            if price:
+                logger.info(f"🟢 從 WebSocket 拿到價格: {price}")
+                return float(price)
 
-        if price is None:
-            ticker = get_ticker(self.symbol)
-            if not ticker or not isinstance(ticker, dict):
-                logging.error(f"獲取 ticker 失敗或格式錯誤: {ticker}")
-                return
+        # Fallback 改從 REST API 取得 ticker
+        ticker = get_ticker(self.symbol.replace("-", "_"))
+        logger.debug(f"🔄 從 REST API 拿到 ticker: {ticker}")
 
-           
-            
-        return price
+        if not ticker or not isinstance(ticker, dict):
+            logging.error(f"獲取 ticker 失敗或格式錯誤: {ticker}")
+            return None
+
+        price_str = ticker.get("lastPrice") or ticker.get("price")  # 看 API 回傳格式
+        if price_str is None:
+            logging.error(f"Ticker 不包含價格欄位: {ticker}")
+            return None
+
+        try:
+            return float(price_str)
+        except Exception as e:
+            logging.error(f"轉換價格失敗: {price_str} -> {e}")
+            return None
 
     def get_market_depth(self):
         """獲取市場深度（優先使用WebSocket數據）"""
@@ -1209,29 +1224,31 @@ class MartingaleLongTrader:
                     continue
                 
                 orders.append(('Bid', target_price, quantity))
+            logger.info(f"📌 進行馬丁下單: {len(orders)} 筆訂單")
 
             # 執行下單
             for side, price, quantity in orders:
                 order_details = {
                     "symbol": self.symbol,
                     "side": side,
-                    "orderType": "Market",
-                    "quantity": str(quantity),
-                    "timeInForce": "GTC"}
+                    'quantity': quantity,
+                    'use_market_order': self.use_market_order,
+                }
+                logger.info(f"📤 提交訂單: {order_details}")
 
                 result = self.client.execute_order(order_details)
-                if result.get('status') == 'FILLED':
+
+                logger.debug(f"下單回傳結果: {result} | 類型: {type(result)}")
+
+                if isinstance(result, dict) and result.get('status') == 'FILLED':
                     logger.info(
-                        f"層級{
-                            self.current_layer}下單成功 | {side} {quantity}@{price}")
+                        f"✅ 層級{self.current_layer}下單成功 | {side} {quantity}@{price}")
                     self._update_position(
-                        price, quantity, allocated_funds[self.current_layer])
+                        price, quantity, self.allocated_funds[self.current_layer])
                     self.current_layer += 1
                 else:
                     logger.warning(
-                        f"層級{
-                            self.current_layer}下單失敗 | {
-                            result.get('message')}")
+                        f"❌ 層級{self.current_layer}下單失敗 | 回應: {result.get('message') if isinstance(result, dict) else result}")
 
             # 風控檢查
             self._check_risk()
