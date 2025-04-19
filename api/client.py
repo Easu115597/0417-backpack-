@@ -15,10 +15,20 @@ from logger import setup_logger
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 MARKET_ENDPOINT = "https://api.backpack.exchange/api/v1/markets"
 
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 
 logger = setup_logger("api.client")
 BASE_URL = "https://api.backpack.exchange"
 logger = logging.getLogger(__name__)
+
+HEADERS = {
+    "Content-Type": "application/json",
+    "X-BACKPACK-APIKEY": API_KEY
+}
+
+from dotenv import load_dotenv
+load_dotenv()
 
 class BackpackAPIClient:
     def __init__(self, api_key=None, secret_key=None):
@@ -174,12 +184,16 @@ class BackpackAPIClient:
                 base64.b64decode(self.secret_key)
             )
             signature = base64.b64encode(private_key.sign(message.encode())).decode()
+            logger.debug(f"簽名消息原文: {message}")
+            logger.debug(f"API密鑰: {self.api_key}")
+            logger.debug(f"私鑰長度: {len(base64.b64decode(self.secret_key))}")  # 應為32字節
             return {
                 "X-API-KEY": self.api_key,
                 "X-SIGNATURE": signature,
                 "X-TIMESTAMP": timestamp,
                 "X-WINDOW": window
             }
+            
         except Exception as e:
             logger.error(f"簽名生成失敗: {str(e)}")
             return {}
