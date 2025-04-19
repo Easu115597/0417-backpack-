@@ -12,6 +12,7 @@ from config import API_URL, API_VERSION, DEFAULT_WINDOW
 from logger import setup_logger
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 MARKET_ENDPOINT = "https://api.backpack.exchange/api/v1/markets"
+BASE_URL = "https://api.backpack.exchange"
 
 logger = setup_logger("api.client")
 
@@ -377,11 +378,18 @@ def cancel_order(api_key, secret_key, order_id, symbol):
     data = {"orderId": order_id, "symbol": symbol}
     return make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
 
-def get_ticker(symbol):
-    """獲取市場價格"""
-    endpoint = f"/api/{API_VERSION}/ticker"
-    params = {"symbol": symbol}
-    return make_request("GET", endpoint, params=params)
+def get_ticker(symbol: str) -> float:
+    try:
+        symbol = symbol.replace('-', '_').upper()  # ✅ 自動格式轉換
+        url = f"{BASE_URL}/api/v1/market/ticker?symbol={symbol}"
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        last_price = data.get("lastPrice")
+        return float(last_price) if last_price else 0.0
+    except Exception as e:
+        logger.error(f"獲取價格失敗: {e}")
+        return 0.0
 
 def get_markets():
     """獲取所有交易對信息"""
