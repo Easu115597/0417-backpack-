@@ -6,15 +6,19 @@ import time
 import requests
 import os
 import base64
+import requests
+import logging
 from typing import Dict, Any, Optional, List, Union
 from .auth import create_signature
 from config import API_URL, API_VERSION, DEFAULT_WINDOW
 from logger import setup_logger
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 MARKET_ENDPOINT = "https://api.backpack.exchange/api/v1/markets"
-BASE_URL = "https://api.backpack.exchange"
+
 
 logger = setup_logger("api.client")
+BASE_URL = "https://api.backpack.exchange"
+logger = logging.getLogger(__name__)
 
 class BackpackAPIClient:
     def __init__(self, api_key=None, secret_key=None):
@@ -381,17 +385,15 @@ def cancel_order(api_key, secret_key, order_id, symbol):
 def get_ticker(symbol: str) -> float:
     try:
         symbol = symbol.replace('-', '_').upper()  # ✅ 自動格式轉換
-        url = f"{BASE_URL}/api/v1/spot/tickers"  # ✅ 請求全部 ticker
-        response = requests.get(url)
+        endpoint = f"/api/v1/ticker?symbol={symbol}"  # ✅ 請求全部 ticker
+        response = requests.get(f"{BASE_URL}{endpoint}")
+        return float(response.json()['close'])
         response.raise_for_status()
-        data = response.json()
-        tickers = response.json()
-        
-        for t in tickers:
-            if t.get("symbol") == symbol:
-                return float(t.get("price"))
-
-        logger.error(f"找不到 {symbol} 的價格")
+        tickers = res.json()
+        for ticker in tickers:
+            if ticker.get("market", "").upper() == symbol:
+                return float(ticker["price"])
+        logger.error(f"❌ 未找到價格資訊: {symbol}")
         return 0.0
     except Exception as e:
         logger.error(f"獲取價格失敗: {e}")
@@ -446,6 +448,31 @@ def get_klines(symbol, interval="1h", limit=100):
     }
     
     return make_request("GET", endpoint, params=params)
+
+def get_market_limits(symbol: str) -> dict:
+    """取得單一交易對的市場限制資訊"""
+    try:
+        symbol = symbol.replace("_", "-").upper()
+        logger.info("🟢 get_market_limits() 被呼叫")
+        url = f"{BASE_URL}/api/v1/spot/markets"
+        res = requests.get(url)
+        res.raise_for_status()
+        markets = res.json()
+        for item in markets:
+            if item["id"].upper() == symbol:
+                limits = {
+                    "base_precision": item["baseIncrement"],
+                    "quote_precision": item["quoteIncrement"],
+                    "min_order_size": item["minOrderSize"],
+                    "tick_size": item["tickSize"],
+                }
+                logger.info(f"✅ 取得市場限制成功: {symbol} -> {limits}")
+                return limits
+        logger.error(f"❌ 未找到交易對 {symbol}")
+        return {}
+    except Exception as e:
+        logger.error(f"❌ 市場限制查詢異常: {e}")
+        return {}
 
 
 # 在api/client.py中確保全局實例
