@@ -1193,10 +1193,14 @@ class MartingaleLongTrader:
                 target_price = round_to_tick_size(target_price, self.tick_size)
 
                 quantity = allocated_funds[layer] / target_price
-                quantity = round_to_precision(quantity, self.base_precision)
-
+                # 使用Decimal進行高精度計算
+                quantity = Decimal(quantity).quantize(
+                    Decimal(f'1e-{self.base_precision}'), 
+                    rounding=ROUND_DOWN
+                )
+                quantity = float(quantity)
                 # 強化處理：根據交易所要求截斷小數位
-                quantity_str = format(quantity, f".{self.base_precision}f")
+                quantity_str = f"{quantity:.{self.base_precision}f}"  # 確保小數位正確
                 quantity = float(quantity_str)
                 if isinstance(quantity, float):
                     quantity_str = f"{quantity:.{self.base_precision}f}"
