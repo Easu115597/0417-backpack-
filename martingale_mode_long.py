@@ -15,6 +15,7 @@ from utils.helpers import round_to_precision, round_to_tick_size, calculate_vola
 from logger import setup_logger
 from api.client import BackpackAPIClient
 from api.client import get_market_limits, get_ticker
+from decimal import Decimal, ROUND_DOWN
 
 logger = setup_logger("martingale_long")
 
@@ -834,32 +835,25 @@ class MartingaleLongTrader:
         self.check_ws_connection()
         price = None
 
-        # 優先從 WebSocket 拿價格
+        # 1️⃣ 優先用 WebSocket
         if self.ws and self.ws.connected:
-            price = self.ws.get_current_price()
-            if price:
-                logger.info(f"🟢 從 WebSocket 拿到價格: {price}")
-                return float(price)
+            ws_price = self.ws.get_current_price()
+            if ws_price:
+                logger.info(f"🟢 從 WebSocket 拿到價格: {ws_price}")
+                return float(ws_price)
 
-        # Fallback 改從 REST API 取得 ticker
-        ticker = get_ticker(self.symbol.replace("-", "_"))
-        logger.debug(f"🔄 從 REST API 拿到 ticker: {ticker}")
+        # 2️⃣ fallback：用 REST API 拿 ticker
+        if price is None:
+            price = get_ticker(self.symbol)
+            logging.info(f"🔄 從 REST API 拿到 ticker: {price}")
 
-        if not ticker or not isinstance(ticker, dict):
-            logging.error(f"獲取 ticker 失敗或格式錯誤: {ticker}")
+        if price is None or price <= 0:
+            logging.error(f"❌ 無法獲取當前價格，跳過下單")
             return None
 
-        price_str = ticker.get("lastPrice") or ticker.get("price")  # 看 API 回傳格式
-        if price_str is None:
-            logging.error(f"Ticker 不包含價格欄位: {ticker}")
-            return None
-
-        try:
-            return float(price_str)
-        except Exception as e:
-            logging.error(f"轉換價格失敗: {price_str} -> {e}")
-            return None
-
+        logging.info(f"✅ 成功取得當前價格: {price}")
+        return price
+        
     def get_market_depth(self):
         """獲取市場深度（優先使用WebSocket數據）"""
         self.check_ws_connection()
