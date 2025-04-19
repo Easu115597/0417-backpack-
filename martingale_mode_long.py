@@ -37,6 +37,7 @@ class MartingaleLongTrader:
         use_market_order=True,
         target_price=None,
         duration: int = -1,
+        entry_price=None
         
     ):
         self.api_key = api_key
@@ -56,6 +57,7 @@ class MartingaleLongTrader:
         self.client._sync_server_time()  # 顯式同步時間
         self.duration = duration
         self.interval = 60
+        self.entry_price = float(entry_price) if entry_price else None
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -1203,38 +1205,27 @@ class MartingaleLongTrader:
 
                 quantity = allocated_funds[layer] / target_price
                 # 使用Decimal進行高精度計算
-                quantity = Decimal(quantity).quantize(
-                    Decimal(f'1e-{self.base_precision}'), 
-                    rounding=ROUND_DOWN
-                )
+                quantity = Decimal(quantity).quantize(Decimal(f'1e-{self.base_precision}'), rounding=ROUND_DOWN)
                 quantity = float(quantity)
-                # 強化處理：根據交易所要求截斷小數位
-                quantity_str = f"{quantity:.{self.base_precision}f}"  # 確保小數位正確
-                quantity = float(quantity_str)
-                if isinstance(quantity, (float, int)):
-                    quantity_str = f"{quantity:.{self.base_precision}f}"
-                else:
-                    logger.error(f"無效的訂單量類型: {type(quantity)}")
-                    continue
-                
                 orders.append(('Bid', target_price, quantity))
+                
+                 
             logger.info(f"📌 進行馬丁下單: {len(orders)} 筆訂單")
 
             # 執行下單
-            for side, price, quantity in orders:
+            for idx, (side, price, quantity) in enumerate(orders):
                 order_details = {
-                    "symbol": self.symbol.replace("_", "-"),
+                   "symbol": self.symbol.replace("_", "-"),
                     "side": "Bid",
-                    
-                    'use_market_order': self.use_market_order,
+                    "use_market_order": self.use_market_order
                 }
 
                 if self.use_market_order:
-                   order_details["quoteQuantity"] = allocated_funds[layer]
+                    order_details["quoteQuantity"] = allocated_funds[idx]
                 else:
-                    size = round(allocated_funds[layer] / entry_price, self.base_precision)
-                    order_details["quantity"] = size
-                    order_details["price"] = round(entry_price, self.quote_precision)
+                    order_details["quantity"] = quantity
+                    order_details["price"] = price
+
                 logger.info(f"📤 提交訂單: {order_details}")
                 submit_order(order_details)
 
