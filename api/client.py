@@ -104,26 +104,29 @@ class BackpackAPIClient:
     def get_market_limits(self, symbol: str) -> dict:
         """獲取交易對限制信息（修正結構完整性）"""
         print("🟢 get_market_limits() 被呼叫")
-        endpoint = f"/api/v1/markets"
+        endpoint = "/api/v1/markets"
         try:
-            response = requests.get(MARKET_ENDPOINT)
+            response = requests.get(f"{self.base_url}{endpoint}")
             response.raise_for_status()
-            normalized_symbol = symbol.replace('-', '_').upper()
+            
+            normalized_symbol = symbol.upper().replace('-', '_')
             
             # 添加調試日誌
             logger.debug(f"API原始響應: {response.text}")
-            
+            logger.debug(f"API返回交易對列表: {[m['symbol'] for m in response.json()]}")
             for market in response.json():
-                if market.get('symbol') == normalized_symbol:
-                    result = {
-                        "base_precision": int(market.get("quantityPrecision", 6)),
-                        "quote_precision": int(market.get("pricePrecision", 6)),
-                        "min_order_size": float(market.get("minNotional", 0)),
-                        "tick_size": float(market.get("tickSize", 0.0001)) 
+                if market('symbol') == normalized_symbol:
+                    min_order_size = market.get('minOrderSize', '0.00001')
+                    tick_size = market.get('tickSize', '0.01')
+                    return {
+                        'base_precision': len(min_order_size.split('.')[-1]),
+                        'quote_precision': len(tick_size.split('.')[-1]),
+                        'min_order_size': float(min_order_size),
+                        'tick_size': float(tick_size)
                     }
-                    logger.info(f"✅ 取得市場限制成功: {symbol} -> {result}")
-                    print(f"✅ 取得市場限制: {result}")
-                    return result
+                logger.info(f"✅ 取得市場限制成功: {symbol} -> {result}")
+                print(f"✅ 取得市場限制: {result}")
+                return result
 
             logger.error(f"未找到交易對 {symbol}")
             return None  # ⚠️ 別 return 字串！
@@ -528,9 +531,10 @@ def submit_order(order_details: dict) -> dict:
             payload["price"] = str(order_details.get("price"))
 
          # 🔐 產生簽名與 headers
+        request_path = "/api/v1/order"
         timestamp = str(int(time.time() * 1000))
         method = "POST"
-        path = "/api/v1/order"
+        message = f"{timestamp}{method}{request_path}{json.dumps(order_details)}"
         body = json.dumps(payload)
         signature = create_signature(API_SECRET, timestamp, method, request_path, body)
 
