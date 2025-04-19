@@ -99,7 +99,8 @@ class BackpackAPIClient:
                     result = {
                         "base_precision": int(market.get("quantityPrecision", 6)),
                         "quote_precision": int(market.get("pricePrecision", 6)),
-                        "min_order_siz": float(market.get("minNotional", 0))
+                        "min_order_size": float(market.get("minNotional", 0)),
+                        "tick_size": float(market.get("tickSize", 0.0001)) 
                     }
                     logger.info(f"✅ 取得市場限制成功: {symbol} -> {result}")
                     print(f"✅ 取得市場限制: {result}")
