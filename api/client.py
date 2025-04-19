@@ -11,6 +11,7 @@ from .auth import create_signature
 from config import API_URL, API_VERSION, DEFAULT_WINDOW
 from logger import setup_logger
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+MARKET_ENDPOINT = "https://api.backpack.exchange/api/v1/markets"
 
 logger = setup_logger("api.client")
 
@@ -82,42 +83,39 @@ class BackpackAPIClient:
             return []
     
     def get_market_limits(self, symbol: str) -> dict:
-        """獲取交易對限制信息（修正精度字段）"""
+        """獲取交易對限制信息（修正結構完整性）"""
+        print("🟢 get_market_limits() 被呼叫")
         endpoint = f"/api/v1/markets"
         try:
-            response = requests.get(f"{self.base_url}{endpoint}")
-            if response.status_code == 200:
-                normalized_symbol = symbol.replace('-', '_').upper()
+            response = requests.get(MARKET_ENDPOINT)
+            response.raise_for_status()
+            normalized_symbol = symbol.replace('-', '_').upper()
             
-                # 添加調試日誌
-                logger.debug(f"API原始響應: {response.text}")
+            # 添加調試日誌
+            logger.debug(f"API原始響應: {response.text}")
             
-                for market in response.json():
-                    if market['symbol'] == normalized_symbol:
-                        # 從LOT_SIZE過濾器獲取精度
-                        lot_size_filter = next(
-                            (f for f in market['filters'] if f['filterType'] == 'LOT_SIZE'),
-                            {}
-                        )
-                        price_filter = next(
-                            (f for f in market['filters'] if f['filterType'] == 'PRICE_FILTER'),
-                            {}
-                        )
-                    
-                        return {
-                            'base_precision': len(lot_size_filter.get('minQty', '0.0001').split('.')[-1]),
-                            'quote_precision': len(price_filter.get('tickSize', '0.01').split('.')[-1]),
-                            'min_order_size': float(lot_size_filter.get('minQty', 0)),
-                            'tick_size': float(price_filter.get('tickSize', 0.01))
-                        }
-                logger.error(f"未找到交易對 {normalized_symbol} 的市場限制")
-                return {}
-            logger.error(f"市場限制獲取失敗: HTTP {response.status_code}")
-            return {}
+            for market in response.json():
+                if market.get('symbol') == normalized_symbol:
+                    result = {
+                        "base_precision": int(market.get("quantityPrecision", 6)),
+                        "quote_precision": int(market.get("pricePrecision", 6)),
+                        "min_order_siz": float(market.get("minNotional", 0))
+                    }
+                    logger.info(f"✅ 取得市場限制成功: {symbol} -> {result}")
+                    print(f"✅ 取得市場限制: {result}")
+                    return result
+
+            logger.error(f"未找到交易對 {symbol}")
+            return None  # ⚠️ 別 return 字串！
         except Exception as e:
-            logger.error(f"市場限制查詢異常: {str(e)}")
-            return {}
+            logger.error(f"市場限制查詢異常: {e}")
+            return None
     
+    # 在api/client.py中添加全局格式转换方法
+    def normalize_symbol(symbol: str) -> str:
+        """统一交易对格式为 API 标准格式（大写短横线）"""
+        return symbol.replace('_', '-').upper( )
+
     def get_open_orders(self, symbol: str = None) -> list:
         """獲取未成交訂單"""
         endpoint = f"/api/{API_VERSION}/orders"
@@ -138,6 +136,19 @@ class BackpackAPIClient:
         except Exception as e:
             logger.error(f"獲取未成交訂單失敗: {str(e)}")
             return []
+        
+    def place_martingale_orders(self):
+        # ...計算target_price和allocated_funds...
+        quantity = allocated_funds[layer] / target_price
+        quantity = round_to_precision(quantity, self.base_precision)
+    
+        # 強制符合交易所精度要求
+        quantity_str = f"{quantity:.{self.base_precision}f}"
+        quantity = float(quantity_str)
+    
+        if quantity < self.min_order_size:
+            logger.warning(f"層級{layer}訂單量{quantity}低於最小值{self.min_order_size}，跳過")
+        
         
     def _generate_headers(self, instruction: str, params: dict = None) -> dict:
         """生成API簽名頭部"""
@@ -421,46 +432,6 @@ def get_klines(symbol, interval="1h", limit=100):
     
     return make_request("GET", endpoint, params=params)
 
-def get_market_limits(symbol):
-    """獲取交易對的最低訂單量和價格精度"""
-    markets_info = get_markets()
-    
-    if not isinstance(markets_info, dict) and isinstance(markets_info, list):
-        for market_info in markets_info:
-            if market_info.get('symbol') == symbol:
-                base_asset = market_info.get('baseSymbol')
-                quote_asset = market_info.get('quoteSymbol')
-                
-                # 從filters中獲取精度和最小訂單量信息
-                filters = market_info.get('filters', {})
-                base_precision = 8  # 默認值
-                quote_precision = 8  # 默認值
-                min_order_size = "0"  # 默認值
-                tick_size = "0.00000001"  # 默認值
-                
-                if 'price' in filters:
-                    tick_size = filters['price'].get('tickSize', '0.00000001')
-                    quote_precision = len(tick_size.split('.')[-1]) if '.' in tick_size else 0
-                
-                if 'quantity' in filters:
-                    min_order_size = filters['quantity'].get('minQuantity', '0')
-                    min_value = filters['quantity'].get('minQuantity', '0.00000001')
-                    base_precision = len(min_value.split('.')[-1]) if '.' in min_value else 0
-                
-                return {
-                    'base_asset': base_asset,
-                    'quote_asset': quote_asset,
-                    'base_precision': base_precision,
-                    'quote_precision': quote_precision,
-                    'min_order_size': min_order_size,
-                    'tick_size': tick_size
-                }
-        
-        logger.error(f"找不到交易對 {symbol} 的信息")
-        return None
-    else:
-        logger.error(f"無法獲取交易對信息: {markets_info}")
-        return None
 
 # 在api/client.py中確保全局實例
 client = BackpackAPIClient()  # 模塊級別單例
