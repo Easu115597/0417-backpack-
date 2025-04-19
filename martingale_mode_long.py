@@ -22,7 +22,7 @@ class MartingaleLongTrader:
         self,
         api_key,
         secret_key,
-        symbol,
+        symbol: str,
         db_instance=None,
         total_capital_usdt: float = 100,
         price_step_down: float = 0.008,
@@ -34,10 +34,11 @@ class MartingaleLongTrader:
         use_market_order=True,
         target_price=None,
         duration: int = -1,
+        
     ):
         self.api_key = api_key
         self.secret_key = secret_key
-        self.symbol = symbol
+        self.symbol = symbol.upper()
         self.total_capital = total_capital_usdt
         self.price_step_down = price_step_down
         self.take_profit_pct = take_profit_pct
@@ -51,6 +52,7 @@ class MartingaleLongTrader:
             api_key=api_key, secret_key=secret_key)  # 使用統一客戶端
         self.client._sync_server_time()  # 顯式同步時間
         self.duration = duration
+        self.interval = 60
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -1001,14 +1003,11 @@ class MartingaleLongTrader:
 
             # 構建訂單
             order_details = {
-                "orderType": "Limit",
-                "price": str(sell_price),
+                "orderType": "Market",
                 "quantity": str(quantity),
                 "side": "Ask",
                 "symbol": self.symbol,
-                "timeInForce": "GTC",
-                "postOnly": True
-            }
+                "timeInForce": "GTC"}
 
             # 嘗試執行訂單
             result = execute_order(
@@ -1059,14 +1058,11 @@ class MartingaleLongTrader:
 
             # 構建訂單
             order_details = {
-                "orderType": "Limit",
-                "price": str(buy_price),
+                "orderType": "Market",
                 "quantity": str(quantity),
                 "side": "Bid",
                 "symbol": self.symbol,
-                "timeInForce": "GTC",
-                "postOnly": True
-            }
+                "timeInForce": "GTC"}
 
             # 嘗試執行訂單
             result = execute_order(
@@ -1099,6 +1095,14 @@ class MartingaleLongTrader:
                     self.db.record_rebalance_order(result['id'], self.symbol)
 
         logger.info("倉位重新平衡完成")
+
+    def execute_order(self, order_details):
+        if order_details['orderType'] == 'Market':
+            # 獲取當前最優買賣價
+            bid, ask = self.get_market_depth()
+            worst_price = ask * 1.005 if order_details['side'] == 'Bid' else bid * 0.995
+            order_details['price'] = str(round(worst_price, 8))
+            order_details['orderType'] = 'Limit'  # 轉限價單控制風險
 
     def subscribe_order_updates(self):
         """訂閲訂單更新流"""
@@ -1184,12 +1188,15 @@ class MartingaleLongTrader:
             # 生成訂單列表
             orders = []
             for layer in range(self.current_layer, self.max_layers):
-                target_price = current_price * \
-                    (1 - self.price_step_down * layer)
+                target_price = current_price * (1 - self.price_step_down * layer)
                 target_price = round_to_tick_size(target_price, self.tick_size)
 
                 quantity = allocated_funds[layer] / target_price
                 quantity = round_to_precision(quantity, self.base_precision)
+
+                # 強化處理：根據交易所要求截斷小數位
+                quantity_str = format(quantity, f".{self.base_precision}f")
+                quantity = float(quantity_str)
 
                 if quantity < self.min_order_size:
                     logger.warning(f"層級{layer}訂單量{quantity}低於最小值，跳過")
@@ -1202,12 +1209,9 @@ class MartingaleLongTrader:
                 order_details = {
                     "symbol": self.symbol,
                     "side": side,
-                    "orderType": "Limit",
-                    "price": str(price),
+                    "orderType": "Market",
                     "quantity": str(quantity),
-                    "timeInForce": "GTC",
-                    "postOnly": True
-                }
+                    "timeInForce": "GTC"}
 
                 result = self.client.execute_order(order_details)
                 if result.get('status') == 'FILLED':
@@ -1229,6 +1233,14 @@ class MartingaleLongTrader:
         except Exception as e:
             logger.error(f"馬丁下單異常: {str(e)}")
             self.current_layer = max(0, self.current_layer - 1)  # 回退層級
+
+    def _average_cost(self):
+        """計算平均持倉成本"""
+        if not self.buy_trades:
+            return 0
+        total_cost = sum(price * qty for price, qty in self.buy_trades)
+        total_qty = sum(qty for _, qty in self.buy_trades)
+        return total_cost / total_qty if total_qty > 0 else 0
 
     def _adjust_quantity(self, quantity, side):
         """根据余额动态调整订单量"""
@@ -1411,6 +1423,40 @@ class MartingaleLongTrader:
 
         logger.info(
             f"當前活躍訂單: 買單 {len(self.active_buy_orders)} 個, 賣單 {len(self.active_sell_orders)} 個")
+        
+
+    def close_all_positions(self):
+        """平倉所有持倉（市價單）"""
+        logger.critical("執行動態止損，市價平倉所有持倉")
+    
+        # 獲取當前持倉量
+        net_position = self.total_bought - self.total_sold
+        if net_position == 0:
+            return
+    
+        # 確定平倉方向
+        side = 'Ask' if net_position > 0 else 'Bid'
+        quantity = abs(net_position)
+    
+        # 市價單參數
+        order_details = {
+            "symbol": self.symbol,
+            "side": side,
+            "orderType": "Market",
+            "quantity": str(round_to_precision(quantity, self.base_precision)),
+            "timeInForce": "IOC"
+        }
+    
+        # 執行平倉
+        result = self.client.execute_order(order_details)
+        if 'error' in result:
+            logger.error(f"平倉失敗: {result['error']}")
+        else:
+            logger.info(f"平倉成功: {quantity} {self.base_asset}")
+    
+        # 重置層級
+        self.current_layer = 0
+        self.cancel_existing_orders()
 
     def estimate_profit(self):
         """估算潛在利潤"""
