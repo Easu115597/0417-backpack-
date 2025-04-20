@@ -6,19 +6,30 @@ import time
 import requests
 import os
 import base64
-import requests
 import logging
+import hmac
+import hashlib
+import time
+import base64
 from typing import Dict, Any, Optional, List, Union
 from .auth import create_signature
 from config import API_URL, API_VERSION, DEFAULT_WINDOW
 from logger import setup_logger
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+
 MARKET_ENDPOINT = "https://api.backpack.exchange/api/v1/markets"
 
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 
 logger = setup_logger("api.client")
 BASE_URL = "https://api.backpack.exchange"
 logger = logging.getLogger(__name__)
+
+
+from dotenv import load_dotenv
+load_dotenv()
 
 class BackpackAPIClient:
     def __init__(self, api_key=None, secret_key=None):
@@ -27,6 +38,7 @@ class BackpackAPIClient:
         self.base_url = "https://api.backpack.exchange"
         self.time_offset = 0
         self._sync_server_time()  # 初始化時自動同步時間
+       
     
     def _sync_server_time(self):
         """強化版時間同步"""
@@ -44,6 +56,11 @@ class BackpackAPIClient:
         except Exception as e:
             logger.error(f"時間同步異常: {str(e)}")
             self.time_offset = 0  # 降級使用本地時間
+    
+    def generate_signature(secret, timestamp, method, request_path, body=''):
+        message = f'{timestamp}{method.upper()}{request_path}{body}'
+        signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).digest()
+        return base64.b64encode(signature).decode()
 
     def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> list:
         """獲取K線數據（支持多時間週期）"""
@@ -174,18 +191,34 @@ class BackpackAPIClient:
                 base64.b64decode(self.secret_key)
             )
             signature = base64.b64encode(private_key.sign(message.encode())).decode()
+            logger.debug(f"簽名消息原文: {message}")
+            logger.debug(f"API密鑰: {self.api_key}")
+            logger.debug(f"私鑰長度: {len(base64.b64decode(self.secret_key))}")  # 應為32字節
             return {
                 "X-API-KEY": self.api_key,
                 "X-SIGNATURE": signature,
                 "X-TIMESTAMP": timestamp,
                 "X-WINDOW": window
             }
+            
         except Exception as e:
             logger.error(f"簽名生成失敗: {str(e)}")
             return {}
         
     def execute_order(self, order_details: dict) -> dict:
         """执行订单"""
+        order_details['symbol'] = order_details['symbol'].replace('-', '_').upper()
+
+        # 市價單必須包含quoteQuantity或quantity，但不能同時存在
+        if order_details.get('orderType') == 'Market':
+            if 'quantity' in order_details and 'quoteQuantity' in order_details:
+                order_details.pop('quantity')  # 優先使用quoteQuantity
+    
+        # 添加調試日誌
+        logger.debug(f"提交訂單參數: {json.dumps(order_details, indent=2)}")
+
+
+
         endpoint = f"/api/{API_VERSION}/order"
         try:
             headers = self._generate_headers("orderExecute", order_details)
@@ -448,31 +481,57 @@ def get_klines(symbol, interval="1h", limit=100):
     
     return make_request("GET", endpoint, params=params)
 
-def get_market_limits(symbol: str) -> dict:
-    """取得單一交易對的市場限制資訊"""
-    try:
-        symbol = symbol.replace("_", "-").upper()
-        logger.info("🟢 get_market_limits() 被呼叫")
-        url = f"{BASE_URL}/api/v1/spot/markets"
-        res = requests.get(url)
-        res.raise_for_status()
-        markets = res.json()
-        for item in markets:
-            if item["id"].upper() == symbol:
-                limits = {
-                    "base_precision": item["baseIncrement"],
-                    "quote_precision": item["quoteIncrement"],
-                    "min_order_size": item["minOrderSize"],
-                    "tick_size": item["tickSize"],
-                }
-                logger.info(f"✅ 取得市場限制成功: {symbol} -> {limits}")
-                return limits
-        logger.error(f"❌ 未找到交易對 {symbol}")
-        return {}
-    except Exception as e:
-        logger.error(f"❌ 市場限制查詢異常: {e}")
-        return {}
 
+def submit_order(order_details: dict) -> dict:
+    try:
+        symbol = order_details["symbol"]
+        side = order_details["side"]
+        is_market = order_details.get("use_market_order", False)
+        quantity = order_details.get("quantity", None)
+        quote_quantity = order_details.get("quoteQuantity", None)
+
+        payload = {
+            "symbol": symbol.upper().replace('-', '_'),
+            "side": side,
+            "type": "market" if is_market else "limit"
+        }
+
+        if is_market:
+            if quote_quantity is None:
+                raise ValueError("市價單需提供 quoteQuantity")
+            payload["quoteQuantity"] = str(quote_quantity)
+        else:
+            if quantity is None:
+                raise ValueError("限價單需提供 quantity")
+            payload["quantity"] = str(quantity)
+            payload["price"] = str(order_details.get("price"))
+
+         # 🔐 產生簽名與 headers
+        request_path = "/api/v1/order"
+        timestamp = str(int(time.time() * 1000))
+        method = "POST"
+        message = f"{timestamp}{method}{request_path}{json.dumps(order_details)}"
+        body = json.dumps(payload)
+        signature = create_signature(API_SECRET, timestamp, method, request_path, body)
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-BP-API-KEY": API_KEY,
+            "X-BP-TIMESTAMP": timestamp,
+            "X-BP-API-SIGNATURE": signature,
+        }
+
+        logger.info(f"📤 提交訂單 API Payload: {payload}")
+        response = requests.post(f"{BASE_URL}/api/v1/order", headers=HEADERS, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    except Exception as e:
+        logger.error(f"订单执行失败: {e}")
+        return None
+    
+def format_symbol(symbol: str, for_order: bool = False) -> str:
+    return symbol.replace("_", "-") if for_order else symbol
 
 # 在api/client.py中確保全局實例
 client = BackpackAPIClient()  # 模塊級別單例
