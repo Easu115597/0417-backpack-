@@ -16,12 +16,14 @@ from .auth import create_signature
 from config import API_URL, API_VERSION, DEFAULT_WINDOW
 from logger import setup_logger
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from .auth import create_hmac_signature
+signature = create_hmac_signature(self.secret_key, timestamp, method, path, body)
 
 
 MARKET_ENDPOINT = "https://api.backpack.exchange/api/v1/markets"
 
 API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
+API_SECRET = os.getenv("SECRET_KEY")
 
 logger = setup_logger("api.client")
 BASE_URL = "https://api.backpack.exchange"
@@ -32,11 +34,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class BackpackAPIClient:
-    def __init__(self, api_key=None, secret_key=None):
+    def __init__(self, api_key, secret_key,time_offset=0):
         self.api_key = api_key or os.getenv('API_KEY')
-        self.secret_key = secret_key or os.getenv('API_SECRET')
+        self.secret_key = secret_key or os.getenv('secret_key')
         self.base_url = "https://api.backpack.exchange"
-        self.time_offset = 0
+        self.time_offset = time_offset
         self._sync_server_time()  # 初始化時自動同步時間
        
     
@@ -138,6 +140,63 @@ class BackpackAPIClient:
     def normalize_symbol(symbol: str) -> str:
         """统一交易对格式为 API 标准格式（大写短横线）"""
         return symbol.replace('_', '-').upper( )
+    
+
+
+    def get_headers(self, api_type="rest", **kwargs):
+        if api_type == "instruction":
+            return self._generate_ed25519_headers(**kwargs)
+        else:
+            return self._generate_hmac_headers(**kwargs)
+    
+    def _generate_ed25519_headers(self, instruction: str, params: dict = None) -> dict:
+        """用 Ed25519 生成 instruction API headers"""
+        timestamp = str(int(time.time() * 1000) + self.time_offset)
+        window = "5000"
+        message = f"instruction={instruction}"
+        
+        if params:
+            sorted_params = sorted(params.items())
+            param_str = "&".join([f"{k}={v}" for k, v in sorted_params])
+            message += f"&{param_str}"
+        message += f"&timestamp={timestamp}&window={window}"
+
+        try:
+            private_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(self.secret_key))
+            signature = base64.b64encode(private_key.sign(message.encode())).decode()
+            return {
+                "X-API-KEY": self.api_key,
+                "X-SIGNATURE": signature,
+                "X-TIMESTAMP": timestamp,
+                "X-WINDOW": window
+            }
+        except Exception as e:
+            logger.error(f"Ed25519 簽名生成失敗: {str(e)}")
+            return {}
+
+    def _generate_hmac_headers(self, method: str, path: str, body: str = "") -> dict:
+        """用 HMAC-SHA256 生成 REST API headers"""
+        timestamp = str(int(time.time() * 1000) + self.time_offset)
+        message = f"{timestamp}{method.upper()}{path}{body}"
+        try:
+            signature = hmac.new(
+                self.secret_key.encode(), message.encode(), hashlib.sha256
+            ).hexdigest()
+
+            return {
+                "BP-API-KEY": self.api_key,
+                "BP-API-TIMESTAMP": timestamp,
+                "BP-API-SIGNATURE": signature,
+                "Content-Type": "application/json"
+            }
+        except Exception as e:
+            logger.error(f"HMAC 簽名生成失敗: {e}")
+            return {}
+    
+
+
+
+
 
     def get_open_orders(self, symbol: str = None) -> list:
         """獲取未成交訂單"""
@@ -171,69 +230,7 @@ class BackpackAPIClient:
     
         if quantity < self.min_order_size:
             logger.warning(f"層級{layer}訂單量{quantity}低於最小值{self.min_order_size}，跳過")
-        
-        
-    def _generate_headers(self, instruction: str, params: dict = None) -> dict:
-        """生成API簽名頭部"""
-        timestamp = str(int(time.time() * 1000) + self.time_offset)
-        window = "5000"
-        message = f"instruction={instruction}"
-        
-        if params:
-            sorted_params = sorted(params.items())
-            param_str = "&".join([f"{k}={v}" for k, v in sorted_params])
-            message += f"&{param_str}"
-        message += f"&timestamp={timestamp}&window={window}"
-
-        try:
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-            private_key = Ed25519PrivateKey.from_private_bytes(
-                base64.b64decode(self.secret_key)
-            )
-            signature = base64.b64encode(private_key.sign(message.encode())).decode()
-            logger.debug(f"簽名消息原文: {message}")
-            logger.debug(f"API密鑰: {self.api_key}")
-            logger.debug(f"私鑰長度: {len(base64.b64decode(self.secret_key))}")  # 應為32字節
-            return {
-                "X-API-KEY": self.api_key,
-                "X-SIGNATURE": signature,
-                "X-TIMESTAMP": timestamp,
-                "X-WINDOW": window
-            }
-            
-        except Exception as e:
-            logger.error(f"簽名生成失敗: {str(e)}")
-            return {}
-        
-    def execute_order(self, order_details: dict) -> dict:
-        """执行订单"""
-        order_details['symbol'] = order_details['symbol'].replace('-', '_').upper()
-
-        # 市價單必須包含quoteQuantity或quantity，但不能同時存在
-        if order_details.get('orderType') == 'Market':
-            if 'quantity' in order_details and 'quoteQuantity' in order_details:
-                order_details.pop('quantity')  # 優先使用quoteQuantity
     
-        # 添加調試日誌
-        logger.debug(f"提交訂單參數: {json.dumps(order_details, indent=2)}")
-
-
-
-        endpoint = f"/api/{API_VERSION}/order"
-        try:
-            headers = self._generate_headers("orderExecute", order_details)
-            response = requests.post(
-                f"{self.base_url}{endpoint}",
-                json=order_details,
-                headers=headers
-            )
-            return response.json()
-        except Exception as e:
-            logger.error(f"订单执行失败: {str(e)}")
-            return {"error": str(e)}
-
-
-
 
 
 def get_balance(self, asset: str) -> dict:
@@ -242,19 +239,36 @@ def get_balance(self, asset: str) -> dict:
     response = requests.get(f"{self.base_url}/api/v1/capital", headers=headers)
     # ...處理響應...
 
-def execute_order(self, order_details: dict) -> dict:
+def execute_order(api_key, secret_key, order_details):
+
     """下單"""
     headers = self._generate_headers("orderExecute", order_details)
     response = requests.post(f"{self.base_url}/api/v1/order", json=order_details, headers=headers)
     # ...處理響應...
 
-def _generate_headers(self, instruction: str, params=None) -> dict:
-    """生成簽名頭部"""
-    timestamp = str(int(time.time()*1000) + self.time_offset)
-    # ...簽名生成邏輯...
+  
+    # 提取所有參數用於簽名
+    params = {
+        "orderType": order_details["orderType"],
+        "price": order_details.get("price", "0"),
+        "quantity": order_details["quantity"],
+        "side": order_details["side"],
+        "symbol": order_details["symbol"],
+        "timeInForce": order_details.get("timeInForce", "GTC")
+    }
+    
+    # 添加可選參數
+    for key in ["postOnly", "reduceOnly", "clientId", "quoteQuantity", 
+                "autoBorrow", "autoLendRedeem", "autoBorrowRepay", "autoLend"]:
+        if key in order_details:
+            params[key] = str(order_details[key]).lower() if isinstance(order_details[key], bool) else str(order_details[key])
+    
+    return make_request("POST", endpoint, api_key, secret_key, instruction, params, order_details)
 
-def make_request(method: str, endpoint: str, api_key=None, secret_key=None, instruction=None, 
-                 params=None, data=None, retry_count=3) -> Dict:
+
+
+def make_request(method: str, endpoint: str, api_key: str, secret_key: str, instruction: str, 
+                 params: dict = None, data: dict = None, retry_count=3) -> Dict:
     """
     執行API請求，支持重試機制
     
@@ -367,28 +381,6 @@ def get_balance(api_key, secret_key):
     instruction = "balanceQuery"
     return make_request("GET", endpoint, api_key, secret_key, instruction)
 
-def execute_order(api_key, secret_key, order_details):
-    """執行訂單"""
-    endpoint = f"/api/{API_VERSION}/order"
-    instruction = "orderExecute"
-    
-    # 提取所有參數用於簽名
-    params = {
-        "orderType": order_details["orderType"],
-        "price": order_details.get("price", "0"),
-        "quantity": order_details["quantity"],
-        "side": order_details["side"],
-        "symbol": order_details["symbol"],
-        "timeInForce": order_details.get("timeInForce", "GTC")
-    }
-    
-    # 添加可選參數
-    for key in ["postOnly", "reduceOnly", "clientId", "quoteQuantity", 
-                "autoBorrow", "autoLendRedeem", "autoBorrowRepay", "autoLend"]:
-        if key in order_details:
-            params[key] = str(order_details[key]).lower() if isinstance(order_details[key], bool) else str(order_details[key])
-    
-    return make_request("POST", endpoint, api_key, secret_key, instruction, params, order_details)
 
 def get_open_orders(api_key, secret_key, symbol=None):
     """獲取未成交訂單"""
@@ -512,7 +504,7 @@ def submit_order(order_details: dict) -> dict:
         method = "POST"
         message = f"{timestamp}{method}{request_path}{json.dumps(order_details)}"
         body = json.dumps(payload)
-        signature = create_signature(API_SECRET, timestamp, method, request_path, body)
+        signature = create_signature(SECRET_KEY, timestamp, method, request_path, body)
 
         headers = {
             "Content-Type": "application/json",
