@@ -17,7 +17,7 @@ from config import API_URL, API_VERSION, DEFAULT_WINDOW
 from logger import setup_logger
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from .auth import create_hmac_signature
-signature = create_hmac_signature(self.secret_key, timestamp, method, path, body)
+
 
 
 MARKET_ENDPOINT = "https://api.backpack.exchange/api/v1/markets"
@@ -30,11 +30,12 @@ BASE_URL = "https://api.backpack.exchange"
 logger = logging.getLogger(__name__)
 
 
-from dotenv import load_dotenv
-load_dotenv()
 
 class BackpackAPIClient:
-    def __init__(self, api_key, secret_key,time_offset=0):
+    def __init__(self, api_key=None, secret_key=None, time_offset=0):
+        from dotenv import load_dotenv
+        load_dotenv()
+        
         self.api_key = api_key or os.getenv('API_KEY')
         self.secret_key = secret_key or os.getenv('secret_key')
         self.base_url = "https://api.backpack.exchange"
