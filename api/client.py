@@ -65,6 +65,62 @@ class BackpackAPIClient:
         signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).digest()
         return base64.b64encode(signature).decode()
 
+    
+    def get_headers(self, api_type="rest", **kwargs):
+        if api_type == "instruction":
+            return self._generate_ed25519_headers(**kwargs)
+        else:
+            return self._generate_hmac_headers(**kwargs)
+    
+    def _generate_ed25519_headers(self, instruction: str, params: dict = None) -> dict:
+        """用 Ed25519 生成 instruction API headers"""
+        timestamp = str(int(time.time() * 1000) + self.time_offset)
+        window = "5000"
+        message = f"instruction={instruction}"
+        
+        if params:
+            sorted_params = sorted(params.items())
+            param_str = "&".join([f"{k}={v}" for k, v in sorted_params])
+            message += f"&{param_str}"
+        message += f"&timestamp={timestamp}&window={window}"
+
+        try:
+            private_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(self.secret_key))
+            signature = base64.b64encode(private_key.sign(message.encode())).decode()
+            return {
+                "X-API-KEY": self.api_key,
+                "X-SIGNATURE": signature,
+                "X-TIMESTAMP": timestamp,
+                "X-WINDOW": window
+            }
+        except Exception as e:
+            logger.error(f"Ed25519 簽名生成失敗: {str(e)}")
+            return {}
+
+    def _generate_hmac_headers(self, method: str, path: str, body: str = "") -> dict:
+        """用 HMAC-SHA256 生成 REST API headers"""
+        timestamp = str(int(time.time() * 1000) + self.time_offset)
+        message = f"{timestamp}{method.upper()}{path}{body}"
+        try:
+            signature = hmac.new(
+                self.secret_key.encode(), message.encode(), hashlib.sha256
+            ).hexdigest()
+
+            return {
+                "BP-API-KEY": self.api_key,
+                "BP-API-TIMESTAMP": timestamp,
+                "BP-API-SIGNATURE": signature,
+                "Content-Type": "application/json"
+            }
+        except Exception as e:
+            logger.error(f"HMAC 簽名生成失敗: {e}")
+            return {}
+        
+    # 在api/client.py中添加全局格式转换方法
+    def normalize_symbol(symbol: str) -> str:
+        """统一交易对格式为 API 标准格式（大写短横线）"""
+        return symbol.replace('_', '-').upper( )
+        
     def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> list:
         """獲取K線數據（支持多時間週期）"""
         try:
@@ -141,64 +197,121 @@ class BackpackAPIClient:
         except Exception as e:
             logger.error(f"市場限制查詢異常: {e}")
             return None
-    
-    # 在api/client.py中添加全局格式转换方法
-    def normalize_symbol(symbol: str) -> str:
-        """统一交易对格式为 API 标准格式（大写短横线）"""
-        return symbol.replace('_', '-').upper( )
-    
-
-
-    def get_headers(self, api_type="rest", **kwargs):
-        if api_type == "instruction":
-            return self._generate_ed25519_headers(**kwargs)
-        else:
-            return self._generate_hmac_headers(**kwargs)
-    
-    def _generate_ed25519_headers(self, instruction: str, params: dict = None) -> dict:
-        """用 Ed25519 生成 instruction API headers"""
-        timestamp = str(int(time.time() * 1000) + self.time_offset)
-        window = "5000"
-        message = f"instruction={instruction}"
         
-        if params:
-            sorted_params = sorted(params.items())
-            param_str = "&".join([f"{k}={v}" for k, v in sorted_params])
-            message += f"&{param_str}"
-        message += f"&timestamp={timestamp}&window={window}"
-
-        try:
-            private_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(self.secret_key))
-            signature = base64.b64encode(private_key.sign(message.encode())).decode()
-            return {
-                "X-API-KEY": self.api_key,
-                "X-SIGNATURE": signature,
-                "X-TIMESTAMP": timestamp,
-                "X-WINDOW": window
-            }
-        except Exception as e:
-            logger.error(f"Ed25519 簽名生成失敗: {str(e)}")
-            return {}
-
-    def _generate_hmac_headers(self, method: str, path: str, body: str = "") -> dict:
-        """用 HMAC-SHA256 生成 REST API headers"""
-        timestamp = str(int(time.time() * 1000) + self.time_offset)
-        message = f"{timestamp}{method.upper()}{path}{body}"
-        try:
-            signature = hmac.new(
-                self.secret_key.encode(), message.encode(), hashlib.sha256
-            ).hexdigest()
-
-            return {
-                "BP-API-KEY": self.api_key,
-                "BP-API-TIMESTAMP": timestamp,
-                "BP-API-SIGNATURE": signature,
-                "Content-Type": "application/json"
-            }
-        except Exception as e:
-            logger.error(f"HMAC 簽名生成失敗: {e}")
-            return {}
+    def place_martingale_orders(self):
+        # ...計算target_price和allocated_funds...
+        quantity = allocated_funds[layer] / target_price
+        quantity = round_to_precision(quantity, self.base_precision)
+    
+        # 強制符合交易所精度要求
+        quantity_str = f"{quantity:.{self.base_precision}f}"
+        quantity = float(quantity_str)
+    
+        if quantity < self.min_order_size:
+            logger.warning(f"層級{layer}訂單量{quantity}低於最小值{self.min_order_size}，跳過")
         
+    def make_request(method: str, endpoint: str, api_key: str, secret_key: str, instruction: str, 
+                     params: dict = None, data: dict = None, retry_count=3) -> Dict:
+        """
+        執行API請求，支持重試機制
+    
+        Args:
+            method: HTTP方法 (GET, POST, DELETE)
+            endpoint: API端點
+            api_key: API密鑰
+            secret_key: API密鑰
+            instruction: API指令
+            params: 查詢參數
+            data: 請求體數據
+            retry_count: 重試次數
+        
+        Returns:
+            API響應數據
+        """
+        url = f"{API_URL}{endpoint}"
+        headers = {'Content-Type': 'application/json'}
+    
+        # 構建簽名信息（如需要）
+        if api_key and secret_key and instruction:
+            timestamp = str(int(time.time() * 1000))
+            window = DEFAULT_WINDOW
+        
+            # 構建簽名消息
+            query_string = ""
+            if params:
+                sorted_params = sorted(params.items())
+                query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
+        
+            sign_message = f"instruction={instruction}"
+            if query_string:
+                sign_message += f"&{query_string}"
+            sign_message += f"&timestamp={timestamp}&window={window}"
+    
+            signature = create_signature(self.secret_key, self.sign_message)
+            if not signature:
+                return {"error": "簽名創建失敗"}
+        
+            headers.update({
+                'X-API-KEY': api_key,
+                'X-SIGNATURE': signature,
+                'X-TIMESTAMP': timestamp,
+                'X-WINDOW': window
+            })
+    
+        # 添加查詢參數到URL
+        if params and method.upper() in ['GET', 'DELETE']:
+            query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+            url += f"?{query_string}"
+    
+        # 實施重試機制
+        for attempt in range(retry_count):
+            try:
+                if method.upper() == 'GET':
+                    response = requests.get(url, headers=headers, timeout=10)
+                elif method.upper() == 'POST':
+                    response = requests.post(url, headers=headers, data=json.dumps(data) if data else None, timeout=10)
+                elif method.upper() == 'DELETE':
+                    response = requests.delete(url, headers=headers, data=json.dumps(data) if data else None, timeout=10)
+                else:
+                    return {"error": f"不支持的請求方法: {method}"}
+            
+                # 處理響應
+                if response.status_code in [200, 201]:
+                    return response.json() if response.text.strip() else {}
+                elif response.status_code == 429:  # 速率限制
+                    wait_time = 1 * (2 ** attempt)  # 指數退避
+                    logger.warning(f"遇到速率限制，等待 {wait_time} 秒後重試")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    error_msg = f"狀態碼: {response.status_code}, 消息: {response.text}"
+                    if attempt < retry_count - 1:
+                        logger.warning(f"請求失敗 ({attempt+1}/{retry_count}): {error_msg}")
+                        time.sleep(1)  # 簡單重試延遲
+                        continue
+                    return {"error": error_msg}
+        
+            except requests.exceptions.Timeout:
+                if attempt < retry_count - 1:
+                    logger.warning(f"請求超時 ({attempt+1}/{retry_count})，重試中...")
+                    continue
+                return {"error": "請求超時"}
+            except requests.exceptions.ConnectionError:
+                if attempt < retry_count - 1:
+                    logger.warning(f"連接錯誤 ({attempt+1}/{retry_count})，重試中...")
+                    time.sleep(2)  # 連接錯誤通常需要更長等待
+                    continue
+                return {"error": "連接錯誤"}
+            except Exception as e:
+                if attempt < retry_count - 1:
+                    logger.warning(f"請求異常 ({attempt+1}/{retry_count}): {str(e)}，重試中...")
+                    continue
+                return {"error": f"請求失敗: {str(e)}"}
+    
+        return {"error": "達到最大重試次數"}
+    
+    
+           
 
     def execute_order(api_key, secret_key, order_details):
         """下單"""
@@ -228,11 +341,18 @@ class BackpackAPIClient:
             if key in order_details:
                 params[key] = str(order_details[key]).lower() if isinstance(order_details[key], bool) else str(order_details[key])
     
-        return make_request("POST", endpoint, api_key, secret_key, instruction, params, order_details)
+        return self.make_request("POST", endpoint, api_key, secret_key, instruction, params, order_details)
 
-    
+    def get_balance(self, asset: str) -> dict:
+        """獲取餘額"""
+        headers = self.get_headers(
+            api_type="rest",
+            method="GET",
+            path="/api/v1/balance"
+        )
 
-
+        response = requests.get(f"{self.base_url}/api/v1/capital", headers=headers)
+        # ...處理響應...
 
 
 
@@ -262,172 +382,42 @@ class BackpackAPIClient:
             logger.error(f"獲取未成交訂單失敗: {str(e)}")
             return []
         
-    def place_martingale_orders(self):
-        # ...計算target_price和allocated_funds...
-        quantity = allocated_funds[layer] / target_price
-        quantity = round_to_precision(quantity, self.base_precision)
-    
-        # 強制符合交易所精度要求
-        quantity_str = f"{quantity:.{self.base_precision}f}"
-        quantity = float(quantity_str)
-    
-        if quantity < self.min_order_size:
-            logger.warning(f"層級{layer}訂單量{quantity}低於最小值{self.min_order_size}，跳過")
     
 
+    def get_open_orders(api_key, secret_key, symbol=None):
+        """獲取未成交訂單"""
+        endpoint = f"/api/{API_VERSION}/orders"
+        instruction = "orderQueryAll"
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        return self.make_request("GET", endpoint, api_key, secret_key, instruction, params)
 
-def get_balance(self, asset: str) -> dict:
-    """獲取餘額"""
-    headers = self.get_headers(
-        api_type="rest",
-        method="GET",
-        path="/api/v1/balance"
-    )
+    def cancel_all_orders(api_key, secret_key, symbol):
+        """取消所有訂單"""
+        endpoint = f"/api/{API_VERSION}/orders"
+        instruction = "orderCancelAll"
+        params = {"symbol": symbol}
+        data = {"symbol": symbol}
+        return self.make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
 
-    response = requests.get(f"{self.base_url}/api/v1/capital", headers=headers)
-    # ...處理響應...
-
-
-
-def make_request(method: str, endpoint: str, api_key: str, secret_key: str, instruction: str, 
-                 params: dict = None, data: dict = None, retry_count=3) -> Dict:
-    """
-    執行API請求，支持重試機制
+    def cancel_order(api_key, secret_key, order_id, symbol):
+        """取消指定訂單"""
+        endpoint = f"/api/{API_VERSION}/order"
+        instruction = "orderCancel"
+        params = {"orderId": order_id, "symbol": symbol}
+        data = {"orderId": order_id, "symbol": symbol}
+        return self.make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
     
-    Args:
-        method: HTTP方法 (GET, POST, DELETE)
-        endpoint: API端點
-        api_key: API密鑰
-        secret_key: API密鑰
-        instruction: API指令
-        params: 查詢參數
-        data: 請求體數據
-        retry_count: 重試次數
-        
-    Returns:
-        API響應數據
-    """
-    url = f"{API_URL}{endpoint}"
-    headers = {'Content-Type': 'application/json'}
-    
-    # 構建簽名信息（如需要）
-    if api_key and secret_key and instruction:
-        timestamp = str(int(time.time() * 1000))
-        window = DEFAULT_WINDOW
-        
-        # 構建簽名消息
-        query_string = ""
-        if params:
-            sorted_params = sorted(params.items())
-            query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
-        
-        sign_message = f"instruction={instruction}"
-        if query_string:
-            sign_message += f"&{query_string}"
-        sign_message += f"&timestamp={timestamp}&window={window}"
-    
-        signature = create_signature(secret_key, sign_message)
-        if not signature:
-            return {"error": "簽名創建失敗"}
-        
-        headers.update({
-            'X-API-KEY': api_key,
-            'X-SIGNATURE': signature,
-            'X-TIMESTAMP': timestamp,
-            'X-WINDOW': window
-        })
-    
-    # 添加查詢參數到URL
-    if params and method.upper() in ['GET', 'DELETE']:
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-        url += f"?{query_string}"
-    
-    # 實施重試機制
-    for attempt in range(retry_count):
-        try:
-            if method.upper() == 'GET':
-                response = requests.get(url, headers=headers, timeout=10)
-            elif method.upper() == 'POST':
-                response = requests.post(url, headers=headers, data=json.dumps(data) if data else None, timeout=10)
-            elif method.upper() == 'DELETE':
-                response = requests.delete(url, headers=headers, data=json.dumps(data) if data else None, timeout=10)
-            else:
-                return {"error": f"不支持的請求方法: {method}"}
-            
-            # 處理響應
-            if response.status_code in [200, 201]:
-                return response.json() if response.text.strip() else {}
-            elif response.status_code == 429:  # 速率限制
-                wait_time = 1 * (2 ** attempt)  # 指數退避
-                logger.warning(f"遇到速率限制，等待 {wait_time} 秒後重試")
-                time.sleep(wait_time)
-                continue
-            else:
-                error_msg = f"狀態碼: {response.status_code}, 消息: {response.text}"
-                if attempt < retry_count - 1:
-                    logger.warning(f"請求失敗 ({attempt+1}/{retry_count}): {error_msg}")
-                    time.sleep(1)  # 簡單重試延遲
-                    continue
-                return {"error": error_msg}
-        
-        except requests.exceptions.Timeout:
-            if attempt < retry_count - 1:
-                logger.warning(f"請求超時 ({attempt+1}/{retry_count})，重試中...")
-                continue
-            return {"error": "請求超時"}
-        except requests.exceptions.ConnectionError:
-            if attempt < retry_count - 1:
-                logger.warning(f"連接錯誤 ({attempt+1}/{retry_count})，重試中...")
-                time.sleep(2)  # 連接錯誤通常需要更長等待
-                continue
-            return {"error": "連接錯誤"}
-        except Exception as e:
-            if attempt < retry_count - 1:
-                logger.warning(f"請求異常 ({attempt+1}/{retry_count}): {str(e)}，重試中...")
-                continue
-            return {"error": f"請求失敗: {str(e)}"}
-    
-    return {"error": "達到最大重試次數"}
+    def get_fill_history(api_key, secret_key, symbol=None, limit=100):
+        """獲取歷史成交記錄"""
+        endpoint = f"/wapi/{API_VERSION}/history/fills"
+        instruction = "fillHistoryQueryAll"
+        params = {"limit": str(limit)}
+        if symbol:
+            params["symbol"] = symbol
+        return self.make_request("GET", endpoint, api_key, secret_key, instruction, params)
 
-# 各API端點函數
-def get_deposit_address(api_key, secret_key, blockchain):
-    """獲取存款地址"""
-    endpoint = f"/wapi/{API_VERSION}/capital/deposit/address"
-    instruction = "depositAddressQuery"
-    params = {"blockchain": blockchain}
-    return make_request("GET", endpoint, api_key, secret_key, instruction, params)
-
-def get_balance(api_key, secret_key):
-    """獲取賬戶餘額"""
-    endpoint = f"/api/{API_VERSION}/capital"
-    instruction = "balanceQuery"
-    return make_request("GET", endpoint, api_key, secret_key, instruction)
-
-
-def get_open_orders(api_key, secret_key, symbol=None):
-    """獲取未成交訂單"""
-    endpoint = f"/api/{API_VERSION}/orders"
-    instruction = "orderQueryAll"
-    params = {}
-    if symbol:
-        params["symbol"] = symbol
-    return make_request("GET", endpoint, api_key, secret_key, instruction, params)
-
-def cancel_all_orders(api_key, secret_key, symbol):
-    """取消所有訂單"""
-    endpoint = f"/api/{API_VERSION}/orders"
-    instruction = "orderCancelAll"
-    params = {"symbol": symbol}
-    data = {"symbol": symbol}
-    return make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
-
-def cancel_order(api_key, secret_key, order_id, symbol):
-    """取消指定訂單"""
-    endpoint = f"/api/{API_VERSION}/order"
-    instruction = "orderCancel"
-    params = {"orderId": order_id, "symbol": symbol}
-    data = {"orderId": order_id, "symbol": symbol}
-    return make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
 
 def get_ticker(symbol: str) -> float:
     try:
@@ -456,44 +446,6 @@ def get_order_book(symbol, limit=20):
     params = {"symbol": symbol, "limit": str(limit)}
     return make_request("GET", endpoint, params=params)
 
-def get_fill_history(api_key, secret_key, symbol=None, limit=100):
-    """獲取歷史成交記錄"""
-    endpoint = f"/wapi/{API_VERSION}/history/fills"
-    instruction = "fillHistoryQueryAll"
-    params = {"limit": str(limit)}
-    if symbol:
-        params["symbol"] = symbol
-    return make_request("GET", endpoint, api_key, secret_key, instruction, params)
-
-def get_klines(symbol, interval="1h", limit=100):
-    """獲取K線數據"""
-    data = public_client.get_klines(
-        symbol=symbol,
-        interval=interval,
-        limit_count=limit_count  # 參數名根據SDK文檔修正
-    )
-    
-    # 計算起始時間 (秒)
-    current_time = int(time.time())
-    
-    # 各間隔對應的秒數
-    interval_seconds = {
-        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
-        "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800,
-        "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800, "1month": 2592000
-    }
-    
-    # 計算合適的起始時間
-    duration = interval_seconds.get(interval, 3600)
-    start_time = current_time - (duration * limit)
-    
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "startTime": str(start_time)
-    }
-    
-    return make_request("GET", endpoint, params=params)
 
 
 def submit_order(order_details: dict) -> dict:
