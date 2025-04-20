@@ -83,7 +83,12 @@ class BackpackAPIClient:
             }
         
             # 生成簽名頭部
-            headers = self._generate_headers("klinesQuery", params)
+            headers = self.get_headers(
+                api_type="rest",
+                method="GET",
+                path="/api/v1/klines",
+                body=json.dumps(params)
+            )
         
             # 發送請求
             response = requests.get(
@@ -193,6 +198,38 @@ class BackpackAPIClient:
         except Exception as e:
             logger.error(f"HMAC 簽名生成失敗: {e}")
             return {}
+        
+
+    def execute_order(api_key, secret_key, order_details):
+        """下單"""
+        headers = self.get_headers(
+            api_type="rest",
+            method="POST",
+            path="/api/v1/order",
+            body=json.dumps(order_details)
+        )
+        response = requests.post(f"{self.base_url}/api/v1/order", json=order_details, headers=headers)
+        # ...處理響應...
+
+  
+        # 提取所有參數用於簽名
+        params = {
+            "orderType": order_details["orderType"],
+            "price": order_details.get("price", "0"),
+            "quantity": order_details["quantity"],
+            "side": order_details["side"],
+            "symbol": order_details["symbol"],
+            "timeInForce": order_details.get("timeInForce", "GTC")
+        }
+    
+        # 添加可選參數
+        for key in ["postOnly", "reduceOnly", "clientId", "quoteQuantity", 
+                    "autoBorrow", "autoLendRedeem", "autoBorrowRepay", "autoLend"]:
+            if key in order_details:
+                params[key] = str(order_details[key]).lower() if isinstance(order_details[key], bool) else str(order_details[key])
+    
+        return make_request("POST", endpoint, api_key, secret_key, instruction, params, order_details)
+
     
 
 
@@ -207,7 +244,12 @@ class BackpackAPIClient:
             params["symbol"] = symbol.replace('-', '_')
         
         try:
-            headers = self._generate_headers("orderQueryAll", params)
+            headers = self.get_headers(
+                api_type="rest",
+                method="GET",
+                path="/api/v1/orders",
+                body=json.dumps(params)
+            )
             response = requests.get(
                 f"{self.base_url}{endpoint}",
                 params=params,
@@ -236,35 +278,14 @@ class BackpackAPIClient:
 
 def get_balance(self, asset: str) -> dict:
     """獲取餘額"""
-    headers = self._generate_headers("balanceQuery")
+    headers = self.get_headers(
+        api_type="rest",
+        method="GET",
+        path="/api/v1/balance"
+    )
+
     response = requests.get(f"{self.base_url}/api/v1/capital", headers=headers)
     # ...處理響應...
-
-def execute_order(api_key, secret_key, order_details):
-
-    """下單"""
-    headers = self._generate_headers("orderExecute", order_details)
-    response = requests.post(f"{self.base_url}/api/v1/order", json=order_details, headers=headers)
-    # ...處理響應...
-
-  
-    # 提取所有參數用於簽名
-    params = {
-        "orderType": order_details["orderType"],
-        "price": order_details.get("price", "0"),
-        "quantity": order_details["quantity"],
-        "side": order_details["side"],
-        "symbol": order_details["symbol"],
-        "timeInForce": order_details.get("timeInForce", "GTC")
-    }
-    
-    # 添加可選參數
-    for key in ["postOnly", "reduceOnly", "clientId", "quoteQuantity", 
-                "autoBorrow", "autoLendRedeem", "autoBorrowRepay", "autoLend"]:
-        if key in order_details:
-            params[key] = str(order_details[key]).lower() if isinstance(order_details[key], bool) else str(order_details[key])
-    
-    return make_request("POST", endpoint, api_key, secret_key, instruction, params, order_details)
 
 
 
