@@ -183,10 +183,10 @@ class BackpackAPIClient:
             for market in response.json():
                 if market.get('symbol') == normalized_symbol:
                     result = {
-                        "base_precision": int(market.get("quantityPrecision", 6)),
-                        "quote_precision": int(market.get("pricePrecision", 6)),
-                        "min_order_size": float(market.get("minNotional", 0)),
-                        "tick_size": float(market.get("tickSize", 0.0001)) 
+                        'base_precision': market['basePrecision'],
+                        'quote_precision': market['quotePrecision'],
+                        'min_order_size': float(market['filters'][0]['minQty']),
+                        'tick_size': float(market['filters'][1]['tickSize'])
                     }
                     logger.info(f"✅ 取得市場限制成功: {symbol} -> {result}")
                     print(f"✅ 取得市場限制: {result}")
@@ -210,7 +210,7 @@ class BackpackAPIClient:
         if quantity < self.min_order_size:
             logger.warning(f"層級{layer}訂單量{quantity}低於最小值{self.min_order_size}，跳過")
         
-    def make_request(method: str, endpoint: str, api_key: str, secret_key: str, instruction: str, 
+    def make_request(self, method: str, endpoint: str, api_key: str, secret_key: str, instruction: str, 
                      params: dict = None, data: dict = None, retry_count=3) -> Dict:
         """
         執行API請求，支持重試機制
@@ -229,7 +229,7 @@ class BackpackAPIClient:
             API響應數據
         """
         url = f"{API_URL}{endpoint}"
-        headers = {'Content-Type': 'application/json'}
+        headers = self._generate_headers(instruction, params)
     
         # 構建簽名信息（如需要）
         if api_key and secret_key and instruction:
@@ -409,15 +409,18 @@ class BackpackAPIClient:
         data = {"orderId": order_id, "symbol": symbol}
         return self.make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
     
-    def get_fill_history(api_key, secret_key, symbol=None, limit=100):
-        """獲取歷史成交記錄"""
-        endpoint = f"/wapi/{API_VERSION}/history/fills"
-        instruction = "fillHistoryQueryAll"
+    def get_fill_history(self, symbol: str = None, limit: int = 100) -> dict:
+        endpoint = "/wapi/v1/history/fills"
+        instruction = "fillHistoryQueryAll"  # 明確指定instruction參數
         params = {"limit": str(limit)}
         if symbol:
-            params["symbol"] = symbol
-        return self.make_request("GET", endpoint, api_key, secret_key, instruction, params)
-
+            params["symbol"] = symbol.replace('-', '_').upper()  # 強制轉換交易對格式
+        return self.make_request(
+            method="GET",
+            endpoint=endpoint,
+            instruction=instruction,  # 補齊缺失參數
+            params=params
+        )
 
 def get_ticker(symbol: str) -> float:
     try:
