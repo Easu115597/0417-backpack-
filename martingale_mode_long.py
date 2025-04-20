@@ -8,13 +8,13 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Union, Any
 from concurrent.futures import ThreadPoolExecutor
 from api.client import get_ticker
-
+from api.client import submit_order
 from ws_client.client import BackpackWebSocket
 from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
 from logger import setup_logger
 from api.client import BackpackAPIClient
-from api.client import get_market_limits, get_ticker
+from api.client import get_ticker
 from decimal import Decimal, ROUND_DOWN
 
 logger = setup_logger("martingale_long")
@@ -37,11 +37,12 @@ class MartingaleLongTrader:
         use_market_order=True,
         target_price=None,
         duration: int = -1,
+        entry_price=None
         
     ):
         self.api_key = api_key
         self.secret_key = secret_key
-        self.symbol = symbol.upper()
+        self.symbol = symbol.upper().replace('-', '_')
         self.total_capital = total_capital_usdt
         self.price_step_down = price_step_down
         self.take_profit_pct = take_profit_pct
@@ -56,6 +57,7 @@ class MartingaleLongTrader:
         self.client._sync_server_time()  # 顯式同步時間
         self.duration = duration
         self.interval = 60
+        self.entry_price = float(entry_price) if entry_price else None
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -1203,31 +1205,34 @@ class MartingaleLongTrader:
 
                 quantity = allocated_funds[layer] / target_price
                 # 使用Decimal進行高精度計算
-                quantity = Decimal(quantity).quantize(
-                    Decimal(f'1e-{self.base_precision}'), 
-                    rounding=ROUND_DOWN
-                )
+                quantity = Decimal(quantity).quantize(Decimal(f'1e-{self.base_precision}'), rounding=ROUND_DOWN)
                 quantity = float(quantity)
-                # 強化處理：根據交易所要求截斷小數位
-                quantity_str = f"{quantity:.{self.base_precision}f}"  # 確保小數位正確
-                quantity = float(quantity_str)
-                if isinstance(quantity, (float, int)):
-                    quantity_str = f"{quantity:.{self.base_precision}f}"
-                else:
-                    logger.error(f"無效的訂單量類型: {type(quantity)}")
-                    continue
-                
                 orders.append(('Bid', target_price, quantity))
+                
+                 
             logger.info(f"📌 進行馬丁下單: {len(orders)} 筆訂單")
 
             # 執行下單
-            for side, price, quantity in orders:
+            for idx, (side, price, quantity) in enumerate(orders):
                 order_details = {
-                    "symbol": self.symbol,
-                    "side": side,
-                    'quantity': quantity,
-                    'use_market_order': self.use_market_order,
+                   "symbol": self.symbol.replace("_", "-"),
+                    "side": "Bid",
+                    "orderType": "Market",
+                    "quoteQuantity": str(allocated_funds[layer]),  # 使用报价资产数量
+                    "timeInForce": "IOC"
+
                 }
+
+                if self.use_market_order:
+                    order_details["quoteQuantity"] = allocated_funds[idx]
+                else:
+                    order_details["quantity"] = quantity
+                    order_details["price"] = price
+
+                logger.info(f"📤 提交訂單: {order_details}")
+                submit_order(order_details)
+
+
                 logger.info(f"📤 提交訂單: {order_details}")
 
                 result = self.client.execute_order(order_details)
