@@ -62,7 +62,7 @@ class BackpackAPIClient:
     
     def generate_signature(secret, timestamp, method, request_path, body=''):
         message = f'{timestamp}{method.upper()}{request_path}{body}'
-        signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).digest()
+        signature = hmac.new(self.secret_key.encode(), message.encode(), hashlib.sha256).digest()
         return base64.b64encode(signature).decode()
 
     
