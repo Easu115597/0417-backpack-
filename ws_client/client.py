@@ -1,10 +1,10 @@
 """
-WebSocket客戶端模塊
+WebSocket客户端模塊
 """
 import json
 import time
 import threading
-import websocket as ws  # 改為 websocket as ws，避免命名衝突
+import websocket as ws
 from typing import Dict, List, Tuple, Any, Optional, Callable
 from config import WS_URL, DEFAULT_WINDOW
 from api.auth import create_signature
@@ -12,12 +12,12 @@ from api.client import get_order_book
 from utils.helpers import calculate_volatility
 from logger import setup_logger
 
-logger = setup_logger("websocket")
+logger = setup_logger("backpack_ws")
 
 class BackpackWebSocket:
-    def __init__(self, api_key, secret_key, symbol, on_message_callback=None, auto_reconnect=True):
+    def __init__(self, api_key, secret_key, symbol, on_message_callback=None, auto_reconnect=True, proxy=None):
         """
-        初始化WebSocket客戶端
+        初始化WebSocket客户端
         
         Args:
             api_key: API密鑰
@@ -25,6 +25,8 @@ class BackpackWebSocket:
             symbol: 交易對符號
             on_message_callback: 消息回調函數
             auto_reconnect: 是否自動重連
+            proxy:  wss代理 支持格式为 http://user:pass@host:port/ 或者 http://host:port
+
         """
         self.api_key = api_key
         self.secret_key = secret_key
@@ -59,7 +61,10 @@ class BackpackWebSocket:
         self.last_heartbeat = time.time()
         self.heartbeat_interval = 30
         self.heartbeat_thread = None
-    
+
+        # 添加代理参数
+        self.proxy = proxy
+
     def initialize_orderbook(self):
         """通過REST API獲取訂單簿初始快照"""
         try:
@@ -153,9 +158,25 @@ class BackpackWebSocket:
             if hasattr(self.ws, 'sock') and self.ws.sock and self.ws.sock.connected:
                 logger.debug("發現socket已經打開，跳過run_forever")
                 return
-                
+
+            proxy_type=None
+            http_proxy_auth=None
+            http_proxy_host=None
+            http_proxy_port=None
+            if self.proxy and 3<=len(self.proxy.split(":"))<=4:
+                arrs=self.proxy.split(":")
+                proxy_type = arrs[0]
+                arrs[1]=arrs[1][2:] #去掉 //
+                if len(arrs)==3:
+                    http_proxy_host = arrs[1]
+                else:
+                    password,http_proxy_host = arrs[2].split("@")
+                    http_proxy_auth=(arrs[1],password)
+                http_proxy_port = arrs[-1]
+
             # 添加ping_interval和ping_timeout參數
-            self.ws.run_forever(ping_interval=self.heartbeat_interval, ping_timeout=10)
+            self.ws.run_forever(ping_interval=self.heartbeat_interval, ping_timeout=10, http_proxy_auth=http_proxy_auth, http_proxy_host=http_proxy_host, http_proxy_port=http_proxy_port, proxy_type=proxy_type)
+
         except Exception as e:
             logger.error(f"WebSocket運行時出錯: {e}")
         finally:
@@ -168,7 +189,7 @@ class BackpackWebSocket:
         self.last_heartbeat = time.time()
         
     def reconnect(self):
-        """改進的重連機制"""
+        """完全斷開並重新建立WebSocket連接"""
         with self.ws_lock:
             if not self.running or self.reconnect_attempts >= self.max_reconnect_attempts:
                 logger.warning(f"重連次數超過上限 ({self.max_reconnect_attempts})，停止重連")
@@ -180,30 +201,46 @@ class BackpackWebSocket:
             logger.info(f"嘗試第 {self.reconnect_attempts} 次重連，等待 {delay} 秒...")
             time.sleep(delay)
             
-            # 確保關閉並清理之前的WebSocket連接
+            # 確保完全斷開連接前先標記連接狀態
+            self.connected = False
+            
+            # 完全斷開並清理之前的WebSocket連接
             if self.ws:
                 try:
+                    # 顯式設置內部標記表明這是用户主動關閉
+                    if hasattr(self.ws, '_closed_by_me'):
+                        self.ws._closed_by_me = True
+                    
+                    # 關閉WebSocket
                     self.ws.close()
                     self.ws.keep_running = False
+                    
+                    # 強制關閉socket
                     if hasattr(self.ws, 'sock') and self.ws.sock:
                         self.ws.sock.close()
+                        self.ws.sock = None
                 except Exception as e:
-                    logger.debug(f"關閉之前的WebSocket連接時出錯: {e}")
+                    logger.error(f"關閉之前的WebSocket連接時出錯: {e}")
                 
-                # 給系統一些時間完全關閉連接
-                time.sleep(0.5)
+                # 給系統更多時間完全關閉連接
+                time.sleep(1.0)  # 增加等待時間
                 self.ws = None
                 
             # 確保舊的線程已終止
             if self.ws_thread and self.ws_thread.is_alive():
                 try:
-                    self.ws_thread.join(timeout=1)
-                except Exception:
-                    pass
+                    # 更長的超時等待線程終止
+                    self.ws_thread.join(timeout=2)
+                except Exception as e:
+                    logger.error(f"等待舊線程終止時出錯: {e}")
             
-            # 創建新的WebSocket連接
-            ws.enableTrace(False)  # 使用 ws.enableTrace
-            self.ws = ws.WebSocketApp(  # 使用 ws.WebSocketApp
+            # 重置所有相關狀態
+            self.ws_thread = None
+            self.subscriptions = []  # 清空訂閲列表，以便重新訂閲
+            
+            # 創建全新的WebSocket連接
+            ws.enableTrace(False)
+            self.ws = ws.WebSocketApp(
                 WS_URL,
                 on_open=self.on_open,
                 on_message=self.on_message,
@@ -213,9 +250,13 @@ class BackpackWebSocket:
                 on_pong=self.on_pong
             )
             
+            # 創建新線程
             self.ws_thread = threading.Thread(target=self.ws_run_forever)
             self.ws_thread.daemon = True
             self.ws_thread.start()
+            
+            # 更新最後心跳時間，避免重連後立即觸發心跳檢測
+            self.last_heartbeat = time.time()
             
             return True
         
@@ -430,25 +471,70 @@ class BackpackWebSocket:
         self.connected = False
         logger.info(f"WebSocket連接已關閉: {close_msg if close_msg else 'No message'} (狀態碼: {close_status_code if close_status_code else 'None'})")
         
+        # 清理當前socket資源
+        if hasattr(ws, 'sock') and ws.sock:
+            try:
+                ws.sock.close()
+                ws.sock = None
+            except Exception as e:
+                logger.debug(f"關閉socket時出錯: {e}")
+        
         if close_status_code == 1000 or getattr(ws, '_closed_by_me', False):
             logger.info("WebSocket正常關閉，不進行重連")
         elif previous_connected and self.running and self.auto_reconnect:
             logger.info("WebSocket非正常關閉，將自動重連")
-            # 觸發重連
-            self.reconnect()
+            # 使用線程觸發重連，避免在回調中直接重連
+            threading.Thread(target=self.reconnect, daemon=True).start()
     
     def close(self):
-        """關閉WebSocket連接"""
+        """完全關閉WebSocket連接"""
         with self.ws_lock:
+            logger.info("主動關閉WebSocket連接...")
             self.running = False
-            if self.ws:
-                self.ws._closed_by_me = True
+            self.connected = False
+            
+            # 停止心跳檢測線程
+            if self.heartbeat_thread and self.heartbeat_thread.is_alive():
                 try:
+                    self.heartbeat_thread.join(timeout=1)
+                except Exception:
+                    pass
+            self.heartbeat_thread = None
+            
+            if self.ws:
+                # 標記為主動關閉
+                if not hasattr(self.ws, '_closed_by_me'):
+                    self.ws._closed_by_me = True
+                else:
+                    self.ws._closed_by_me = True
+                    
+                try:
+                    # 關閉WebSocket
                     self.ws.close()
+                    self.ws.keep_running = False
+                    
+                    # 強制關閉socket
+                    if hasattr(self.ws, 'sock') and self.ws.sock:
+                        self.ws.sock.close()
                 except Exception as e:
                     logger.error(f"關閉WebSocket時出錯: {e}")
-                self.connected = False
-                logger.info("WebSocket連接已主動關閉")
+                
+                # 等待完全關閉
+                time.sleep(0.5)
+                self.ws = None
+            
+            # 清理線程
+            if self.ws_thread and self.ws_thread.is_alive():
+                try:
+                    self.ws_thread.join(timeout=1)
+                except Exception:
+                    pass
+            self.ws_thread = None
+            
+            # 重置訂閲狀態
+            self.subscriptions = []
+            
+            logger.info("WebSocket連接已完全關閉")
     
     def get_current_price(self):
         """獲取當前價格"""
