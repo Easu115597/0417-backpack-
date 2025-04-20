@@ -1108,13 +1108,7 @@ class MartingaleLongTrader:
 
         logger.info("倉位重新平衡完成")
 
-    def execute_order(self, order_details):
-        if order_details['orderType'] == 'Market':
-            # 獲取當前最優買賣價
-            bid, ask = self.get_market_depth()
-            worst_price = ask * 1.005 if order_details['side'] == 'Bid' else bid * 0.995
-            order_details['price'] = str(round(worst_price, 8))
-            order_details['orderType'] = 'Limit'  # 轉限價單控制風險
+
 
     def subscribe_order_updates(self):
         """訂閲訂單更新流"""
@@ -1215,16 +1209,15 @@ class MartingaleLongTrader:
             # 執行下單
             for idx, (side, price, quantity) in enumerate(orders):
                 order_details = {
-                   "symbol": self.symbol.replace("_", "-"),
+                    "symbol": self.symbol.replace("_", "-"),
                     "side": "Bid",
-                    "orderType": "Market",
-                    "quoteQuantity": str(allocated_funds[layer]),  # 使用报价资产数量
-                    "timeInForce": "IOC"
-
+                    "orderType": "Market" if self.use_market_order else "Limit",
+                    "timeInForce": "IOC",
+                    "use_market_order": self.use_market_order
                 }
 
                 if self.use_market_order:
-                    order_details["quoteQuantity"] = allocated_funds[idx]
+                    order_details["quoteQuantity"] = round(allocated_funds[idx], 6)
                 else:
                     order_details["quantity"] = quantity
                     order_details["price"] = price
