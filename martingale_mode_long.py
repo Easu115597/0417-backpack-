@@ -14,7 +14,7 @@ from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
 from logger import setup_logger
 from api.client import BackpackAPIClient
-from api.client import get_ticker
+from api.client import get_ticker 
 from decimal import Decimal, ROUND_DOWN
 
 logger = setup_logger("martingale_long")
@@ -52,8 +52,8 @@ class MartingaleLongTrader:
         self.multiplier = martingale_multiplier
         self.use_market_order = use_market_order
         self.target_price = target_price
-        self.client = BackpackAPIClient(
-            api_key=api_key, secret_key=secret_key)  # 使用統一客戶端
+        from api.client import BackpackAPIClient
+        self.client = BackpackAPIClient(api_key, secret_key)
         self.client._sync_server_time()  # 顯式同步時間
         self.duration = duration
         self.interval = 60
@@ -288,10 +288,8 @@ class MartingaleLongTrader:
 
     def _load_trades_from_api(self):
         """從API加載歷史成交記錄"""
-        from api.client import get_fill_history
-
-        fill_history = get_fill_history(
-            self.api_key, self.secret_key, self.symbol, 100)
+        
+        fill_history = self.client.get_fill_history(symbol=self.symbol, limit=100)
 
         if isinstance(fill_history, dict) and "error" in fill_history:
             logger.error(f"載入成交記錄失敗: {fill_history['error']}")
