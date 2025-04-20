@@ -11,6 +11,7 @@ from api.auth import create_signature
 from api.client import get_order_book
 from utils.helpers import calculate_volatility
 from logger import setup_logger
+from api.client import BackpackAPIClient
 
 logger = setup_logger("backpack_ws")
 
@@ -30,7 +31,7 @@ class BackpackWebSocket:
         """
         self.api_key = api_key
         self.secret_key = secret_key
-        self.symbol = symbol
+        self.symbol = symbol.upper().replace('-', '_')
         self.ws = None
         self.on_message_callback = on_message_callback
         self.connected = False
@@ -41,7 +42,8 @@ class BackpackWebSocket:
         self.order_updates = []
         self.historical_prices = []  # 儲存歷史價格用於計算波動率
         self.max_price_history = 100  # 最多儲存的價格數量
-        
+        self.client = BackpackAPIClient(api_key, secret_key)
+
         # 重連相關參數
         self.auto_reconnect = auto_reconnect
         self.reconnect_delay = 1
@@ -69,7 +71,12 @@ class BackpackWebSocket:
         """通過REST API獲取訂單簿初始快照"""
         try:
             # 使用REST API獲取完整訂單簿
-            order_book = get_order_book(self.symbol, 100)  # 增加深度
+            order_book = self.client.make_request(
+                method="GET",
+                endpoint="/api/v1/depth",
+                instruction="orderbookQuery",
+                params={"symbol": self.symbol, "limit": 100}
+            )  # 增加深度
             if isinstance(order_book, dict) and "error" in order_book:
                 logger.error(f"初始化訂單簿失敗: {order_book['error']}")
                 return False
