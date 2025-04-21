@@ -6,18 +6,22 @@ Backpack Exchange 做市交易程序統一入口
 import argparse
 import sys
 import os
+import logging
+from dotenv import load_dotenv
+
+load_dotenv()# ✅ 這行讓你可以從 .env 讀入 API_KEY / SECRET_KEY
 
 # 嘗試導入需要的模塊
 try:
     from logger import setup_logger
     from config import API_KEY, SECRET_KEY
-    from api.client import MartingaleAPIClient
+    from api.client import BackpackAPIClient
 except ImportError:
     API_KEY = os.getenv('API_KEY')
     SECRET_KEY = os.getenv('SECRET_KEY')
     
     def setup_logger(name):
-        import logging
+        
         logger = logging.getLogger(name)
         logger.setLevel(logging.INFO)
         handler = logging.StreamHandler()
@@ -29,6 +33,7 @@ except ImportError:
 
 # 創建記錄器
 logger = setup_logger("main")
+logging.basicConfig(level=logging.DEBUG)
 
 def parse_arguments():
     """解析命令行參數"""
