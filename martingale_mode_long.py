@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Union, Any
 from concurrent.futures import ThreadPoolExecutor
 from api.client import get_ticker
-from api.client import submit_order
+
 from ws_client.client import BackpackWebSocket
 from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
@@ -1221,7 +1221,7 @@ class MartingaleLongTrader:
                     order_details["price"] = price
 
                 logger.info(f"📤 提交訂單: {order_details}")
-                submit_order(order_details)
+                self.client.submit_order(order_details)
 
 
                 logger.info(f"📤 提交訂單: {order_details}")
