@@ -19,7 +19,9 @@ try:
 except ImportError:
     API_KEY = os.getenv('API_KEY')
     SECRET_KEY = os.getenv('SECRET_KEY')
-    
+    if not API_KEY or not SECRET_KEY:
+        logger.warning("使用 .env 載入 API 金鑰")
+
     def setup_logger(name):
         
         logger = logging.getLogger(name)
@@ -84,6 +86,9 @@ def main():
     if not api_key or not secret_key:
         logger.error("缺少API密鑰，請通過命令行參數或環境變量提供")
         sys.exit(1)
+
+    # ✅ 建立 Backpack API client
+    client = BackpackAPIClient(api_key=api_key, secret_key=secret_key)
     
     # 決定執行模式
     if args.panel:
@@ -112,6 +117,7 @@ def main():
                 args.martingale_symbol = args.martingale_symbol.replace('_', '-')
 
             trader = MartingaleLongTrader(
+                client=client,
                 api_key=api_key,
                 secret_key=secret_key,
                 symbol=args.martingale_symbol,
