@@ -103,7 +103,7 @@ class BackpackAPIClient:
         message = f"{timestamp}{method.upper()}{path}{body}"
         try:
             signature = hmac.new(
-                self.secret_key.encode(), message.encode(), hashlib.sha256
+                self.secret_key.encode('utf-8'), message.encode('utf-8'), hashlib.sha256
             ).hexdigest()
 
             return {
@@ -308,38 +308,6 @@ class BackpackAPIClient:
     
         return {"error": "達到最大重試次數"}
     
-    
-           
-
-    def execute_order(aself, order_details):
-        """下單"""
-        headers = self.get_headers(
-            api_type="rest",
-            method="POST",
-            path="/api/v1/order",
-            body=json.dumps(order_details)
-        )
-        response = requests.post(f"{self.base_url}/api/v1/order", json=order_details, headers=headers)
-        # ...處理響應...
-
-  
-        # 提取所有參數用於簽名
-        params = {
-            "orderType": order_details["orderType"],
-            "price": order_details.get("price", "0"),
-            "quantity": order_details["quantity"],
-            "side": order_details["side"],
-            "symbol": order_details["symbol"],
-            "timeInForce": order_details.get("timeInForce", "GTC")
-        }
-    
-        # 添加可選參數
-        for key in ["postOnly", "reduceOnly", "clientId", "quoteQuantity", 
-                    "autoBorrow", "autoLendRedeem", "autoBorrowRepay", "autoLend"]:
-            if key in order_details:
-                params[key] = str(order_details[key]).lower() if isinstance(order_details[key], bool) else str(order_details[key])
-    
-        return self.make_request("POST", endpoint,  instruction, params, order_details)
 
     def get_balance(self, asset: str) -> dict:
         """獲取餘額"""
@@ -392,7 +360,7 @@ class BackpackAPIClient:
             params=params
         )
     
-    def submit_order(order_details: dict) -> dict:
+    def submit_order(self,order_details: dict) -> dict:
         try:
             symbol = order_details["symbol"]
             side = order_details["side"]
@@ -426,9 +394,18 @@ class BackpackAPIClient:
             headers = signature  # _generate_hmac_headers 直接回傳 headers dict
 
             logger.info(f"📤 提交訂單 API Payload: {payload}")
+            print("🧾 headers:", headers)
+            
+            logger.debug(f"headers = {headers}")
+            logger.debug(f"POST {self.base_url + '/api/v1/order'} with payload = {payload}")
+
             response = requests.post(f"{self.base_url}/api/v1/order", headers=headers, json=payload)
             response.raise_for_status()
             return response.json()
+
+        except requests.exceptions.HTTPError as http_err:
+            logger.error(f"API 回應失敗: {response.status_code} - {response.text}")
+            return {"error": response.text}
 
         except Exception as e:
             logger.error(f"订单执行失败: {e}")
