@@ -183,10 +183,10 @@ class BackpackAPIClient:
             for market in response.json():
                 if market.get('symbol') == normalized_symbol:
                     result = {
-                        'base_precision': market['basePrecision'],
-                        'quote_precision': market['quotePrecision'],
-                        'min_order_size': float(market['filters'][0]['minQty']),
-                        'tick_size': float(market['filters'][1]['tickSize'])
+                        'base_precision': int(market.get("quantityPrecision", 6)),
+                        'quote_precision': int(market.get("pricePrecision", 6)),
+                        'min_order_size': float(market.get("minNotional", 0)),
+                        'tick_size': float(market.get("tickSize", 0.0001))
                     }
                     logger.info(f"✅ 取得市場限制成功: {symbol} -> {result}")
                     print(f"✅ 取得市場限制: {result}")
@@ -210,8 +210,7 @@ class BackpackAPIClient:
         if quantity < self.min_order_size:
             logger.warning(f"層級{layer}訂單量{quantity}低於最小值{self.min_order_size}，跳過")
         
-    def make_request(self, method: str, endpoint: str, api_key: str, secret_key: str, instruction: str, 
-                     params: dict = None, data: dict = None, retry_count=3) -> Dict:
+    def make_request(self, method, endpoint, instruction=None, params=None, data=None, retry_count=3):
         """
         執行API請求，支持重試機制
     
@@ -228,34 +227,33 @@ class BackpackAPIClient:
         Returns:
             API響應數據
         """
-        url = f"{API_URL}{endpoint}"
-        headers = self._generate_headers(instruction, params)
+        url = f"{self.base_url}{endpoint}"
+        headers = {"Content-Type": "application/json"}
     
         # 構建簽名信息（如需要）
-        if api_key and secret_key and instruction:
+        if instruction:
             timestamp = str(int(time.time() * 1000))
-            window = DEFAULT_WINDOW
-        
-            # 構建簽名消息
+            window = "5000"
             query_string = ""
+
             if params:
                 sorted_params = sorted(params.items())
                 query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
-        
+
             sign_message = f"instruction={instruction}"
             if query_string:
                 sign_message += f"&{query_string}"
             sign_message += f"&timestamp={timestamp}&window={window}"
-    
-            signature = create_signature(self.secret_key, self.sign_message)
+
+            signature = create_signature(self.secret_key, sign_message)
             if not signature:
-                return {"error": "簽名創建失敗"}
+                return {"error": "簽名失敗"}
         
             headers.update({
-                'X-API-KEY': api_key,
-                'X-SIGNATURE': signature,
-                'X-TIMESTAMP': timestamp,
-                'X-WINDOW': window
+                "X-API-KEY": self.api_key,
+                "X-SIGNATURE": signature,
+                "X-TIMESTAMP": timestamp,
+                "X-WINDOW": window,
             })
     
         # 添加查詢參數到URL
@@ -313,7 +311,7 @@ class BackpackAPIClient:
     
            
 
-    def execute_order(api_key, secret_key, order_details):
+    def execute_order(aself, order_details):
         """下單"""
         headers = self.get_headers(
             api_type="rest",
@@ -341,7 +339,7 @@ class BackpackAPIClient:
             if key in order_details:
                 params[key] = str(order_details[key]).lower() if isinstance(order_details[key], bool) else str(order_details[key])
     
-        return self.make_request("POST", endpoint, api_key, secret_key, instruction, params, order_details)
+        return self.make_request("POST", endpoint,  instruction, params, order_details)
 
     def get_balance(self, asset: str) -> dict:
         """獲取餘額"""
@@ -354,60 +352,32 @@ class BackpackAPIClient:
         response = requests.get(f"{self.base_url}/api/v1/capital", headers=headers)
         # ...處理響應...
 
+          
 
-
-    def get_open_orders(self, symbol: str = None) -> list:
-        """獲取未成交訂單"""
-        endpoint = f"/api/{API_VERSION}/orders"
-        params = {}
-        if symbol:
-            params["symbol"] = symbol.replace('-', '_')
-        
-        try:
-            headers = self.get_headers(
-                api_type="rest",
-                method="GET",
-                path="/api/v1/orders",
-                body=json.dumps(params)
-            )
-            response = requests.get(
-                f"{self.base_url}{endpoint}",
-                params=params,
-                headers=headers
-            )
-            if response.status_code == 200:
-                return response.json()
-            return []
-        except Exception as e:
-            logger.error(f"獲取未成交訂單失敗: {str(e)}")
-            return []
-        
-    
-
-    def get_open_orders(api_key, secret_key, symbol=None):
+    def get_open_orders(self, symbol=None):
         """獲取未成交訂單"""
         endpoint = f"/api/{API_VERSION}/orders"
         instruction = "orderQueryAll"
         params = {}
         if symbol:
             params["symbol"] = symbol
-        return self.make_request("GET", endpoint, api_key, secret_key, instruction, params)
+        return self.make_request("GET", endpoint,  instruction, params)
 
-    def cancel_all_orders(api_key, secret_key, symbol):
+    def cancel_all_orders(self, symbol):
         """取消所有訂單"""
         endpoint = f"/api/{API_VERSION}/orders"
         instruction = "orderCancelAll"
         params = {"symbol": symbol}
         data = {"symbol": symbol}
-        return self.make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
+        return self.make_request("DELETE", endpoint, instruction, params, data)
 
-    def cancel_order(api_key, secret_key, order_id, symbol):
+    def cancel_order(self, order_id, symbol):
         """取消指定訂單"""
         endpoint = f"/api/{API_VERSION}/order"
         instruction = "orderCancel"
         params = {"orderId": order_id, "symbol": symbol}
         data = {"orderId": order_id, "symbol": symbol}
-        return self.make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
+        return self.make_request("DELETE", endpoint, instruction, params, data)
     
     def get_fill_history(self, symbol: str = None, limit: int = 100) -> dict:
         endpoint = "/wapi/v1/history/fills"
@@ -421,6 +391,48 @@ class BackpackAPIClient:
             instruction=instruction,  # 補齊缺失參數
             params=params
         )
+    
+    def submit_order(order_details: dict) -> dict:
+        try:
+            symbol = order_details["symbol"]
+            side = order_details["side"]
+            is_market = order_details.get("use_market_order", False)
+            quantity = order_details.get("quantity", None)
+            quote_quantity = order_details.get("quoteQuantity", None)
+
+            payload = {
+                "symbol": symbol.upper().replace('-', '_'),
+                "side": side,
+                "type": "market" if is_market else "limit"
+            }
+
+            if is_market:
+                if quote_quantity is None:
+                    raise ValueError("市價單需提供 quoteQuantity")
+                payload["quoteQuantity"] = str(quote_quantity)
+            else:
+                if quantity is None:
+                    raise ValueError("限價單需提供 quantity")
+                payload["quantity"] = str(quantity)
+                payload["price"] = str(order_details.get("price"))
+
+             # 🔐 產生簽名與 headers
+            request_path = "/api/v1/order"
+            timestamp = str(int(time.time() * 1000))
+            method = "POST"
+            body = json.dumps(payload)
+            signature = self._generate_hmac_headers(method, request_path, body)
+
+            headers = signature  # _generate_hmac_headers 直接回傳 headers dict
+
+            logger.info(f"📤 提交訂單 API Payload: {payload}")
+            response = requests.post(f"{self.base_url}/api/v1/order", headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+
+        except Exception as e:
+            logger.error(f"订单执行失败: {e}")
+            return {"error": str(e)}
 
 def get_ticker(symbol: str) -> float:
     try:
@@ -451,53 +463,7 @@ def get_order_book(symbol, limit=20):
 
 
 
-def submit_order(order_details: dict) -> dict:
-    try:
-        symbol = order_details["symbol"]
-        side = order_details["side"]
-        is_market = order_details.get("use_market_order", False)
-        quantity = order_details.get("quantity", None)
-        quote_quantity = order_details.get("quoteQuantity", None)
 
-        payload = {
-            "symbol": symbol.upper().replace('-', '_'),
-            "side": side,
-            "type": "market" if is_market else "limit"
-        }
-
-        if is_market:
-            if quote_quantity is None:
-                raise ValueError("市價單需提供 quoteQuantity")
-            payload["quoteQuantity"] = str(quote_quantity)
-        else:
-            if quantity is None:
-                raise ValueError("限價單需提供 quantity")
-            payload["quantity"] = str(quantity)
-            payload["price"] = str(order_details.get("price"))
-
-         # 🔐 產生簽名與 headers
-        request_path = "/api/v1/order"
-        timestamp = str(int(time.time() * 1000))
-        method = "POST"
-        message = f"{timestamp}{method}{request_path}{json.dumps(order_details)}"
-        body = json.dumps(payload)
-        signature = create_signature(SECRET_KEY, timestamp, method, request_path, body)
-
-        headers = {
-            "Content-Type": "application/json",
-            "X-BP-API-KEY": API_KEY,
-            "X-BP-TIMESTAMP": timestamp,
-            "X-BP-API-SIGNATURE": signature,
-        }
-
-        logger.info(f"📤 提交訂單 API Payload: {payload}")
-        response = requests.post(f"{BASE_URL}/api/v1/order", headers=HEADERS, json=payload)
-        response.raise_for_status()
-        return response.json()
-
-    except Exception as e:
-        logger.error(f"订单执行失败: {e}")
-        return None
     
 def format_symbol(symbol: str, for_order: bool = False) -> str:
     return symbol.replace("_", "-") if for_order else symbol
