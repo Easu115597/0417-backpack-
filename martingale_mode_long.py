@@ -40,8 +40,8 @@ class MartingaleLongTrader:
         entry_price=None
         
     ):
-        self.api_key = api_key
-        self.secret_key = secret_key
+        self.api_key = api_key or os.getenv("API_KEY")
+        self.secret_key = secret_key or os.getenv("SECRET_KEY")
         self.symbol = symbol.upper().replace('-', '_')
         self.total_capital = total_capital_usdt
         self.price_step_down = price_step_down
@@ -1020,8 +1020,7 @@ class MartingaleLongTrader:
                 "timeInForce": "GTC"}
 
             # 嘗試執行訂單
-            result = execute_order(
-                self.api_key, self.secret_key, order_details)
+            result = self.client.submit_order(order_details)
 
             # 處理可能的錯誤
             if isinstance(result, dict) and "error" in result:
@@ -1032,8 +1031,7 @@ class MartingaleLongTrader:
                 if "POST_ONLY_TAKER" in error_msg or "Order would immediately match" in error_msg:
                     logger.info("嘗試使用非postOnly訂單進行重新平衡...")
                     order_details.pop("postOnly", None)
-                    result = execute_order(
-                        self.api_key, self.secret_key, order_details)
+                    result = self.client.submit_order(order_details)
 
                     if isinstance(result, dict) and "error" in result:
                         logger.error(f"非postOnly賣單執行失敗: {result['error']}")
@@ -1075,8 +1073,7 @@ class MartingaleLongTrader:
                 "timeInForce": "GTC"}
 
             # 嘗試執行訂單
-            result = execute_order(
-                self.api_key, self.secret_key, order_details)
+            result = self.client.submit_order(order_details)
 
             # 處理可能的錯誤
             if isinstance(result, dict) and "error" in result:
@@ -1087,8 +1084,7 @@ class MartingaleLongTrader:
                 if "POST_ONLY_TAKER" in error_msg or "Order would immediately match" in error_msg:
                     logger.info("嘗試使用非postOnly訂單進行重新平衡...")
                     order_details.pop("postOnly", None)
-                    result = execute_order(
-                        self.api_key, self.secret_key, order_details)
+                    result = self.client.submit_order(order_details)
 
                     if isinstance(result, dict) and "error" in result:
                         logger.error(f"非postOnly買單執行失敗: {result['error']}")
@@ -1226,7 +1222,7 @@ class MartingaleLongTrader:
 
                 logger.info(f"📤 提交訂單: {order_details}")
 
-                result = self.client.execute_order(order_details)
+                result = self.client.submit_order(order_details)
 
                 logger.debug(f"下單回傳結果: {result} | 類型: {type(result)}")
 
@@ -1461,7 +1457,7 @@ class MartingaleLongTrader:
         }
     
         # 執行平倉
-        result = self.client.execute_order(order_details)
+        result = self.client.submit_order(order_details)
         if 'error' in result:
             logger.error(f"平倉失敗: {result['error']}")
         else:
