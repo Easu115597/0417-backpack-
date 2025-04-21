@@ -22,9 +22,9 @@ logger = setup_logger("martingale_long")
 
 class MartingaleLongTrader:
     def __init__(
-        self,
+        self,client,
         api_key,
-        secret_key,
+        secret_key,        
         symbol: str,
         db_instance=None,
         total_capital_usdt: float = 100,
@@ -51,9 +51,8 @@ class MartingaleLongTrader:
         self.max_layers = max_layers
         self.multiplier = martingale_multiplier
         self.use_market_order = use_market_order
-        self.target_price = target_price
-        from api.client import BackpackAPIClient
-        self.client = BackpackAPIClient(api_key, secret_key)
+        self.target_price = target_price        
+        self.client = client
         self.client._sync_server_time()  # 顯式同步時間
         self.duration = duration
         self.interval = 60
