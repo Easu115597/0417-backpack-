@@ -153,6 +153,23 @@ check_order_fills()：​檢查已下訂單的成交情況，更新策略狀態�
 close_all_positions()：​在策略終止時，平倉所有持倉，確保資金安全。
 
 
+馬丁策略的主循環流程，會呼叫：
+
+_ensure_data_streams() ✅ 初始化 WebSocket 和訂閱
+
+cancel_existing_orders() ✅ 取消所有現有掛單
+
+get_current_price() ✅ 透過 WebSocket 或 REST 拿價格
+
+_check_risk() ✅ 判斷是否觸發止盈/止損
+
+place_martingale_orders() ✅ 執行實際下單
+
+裡面會用到：generate_martingale_orders() ➜ calculate_prices()、allocate_funds()
+
+
+
+
 
 專案中，API 認證主要透過 auth.py 處理，並在 client.py 中應用。​
 
