@@ -13,8 +13,8 @@ from ws_client.client import BackpackWebSocket
 from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
 from logger import setup_logger
-from api.client import BackpackAPIClient
-from api.client import get_ticker 
+
+
 from decimal import Decimal, ROUND_DOWN
 
 logger = setup_logger("martingale_long")
@@ -22,9 +22,10 @@ logger = setup_logger("martingale_long")
 
 class MartingaleLongTrader:
     def __init__(
-        self,client,
-        api_key,
-        secret_key,        
+        self,
+        client,
+        
+        
         symbol: str,
         db_instance=None,
         total_capital_usdt: float = 100,
@@ -40,8 +41,9 @@ class MartingaleLongTrader:
         entry_price=None
         
     ):
-        self.api_key = api_key or os.getenv("API_KEY")
-        self.secret_key = secret_key or os.getenv("SECRET_KEY")
+        self.client = client  # ✅ 儲存傳入的 client
+        self.client._sync_server_time()  # ⏰ 建議保留：同步 API 時間偏移
+        
         self.symbol = symbol.upper().replace('-', '_')
         self.total_capital = total_capital_usdt
         self.price_step_down = price_step_down
@@ -51,9 +53,7 @@ class MartingaleLongTrader:
         self.max_layers = max_layers
         self.multiplier = martingale_multiplier
         self.use_market_order = use_market_order
-        self.target_price = target_price        
-        self.client = client
-        self.client._sync_server_time()  # 顯式同步時間
+        self.target_price = target_price                
         self.duration = duration
         self.interval = 60
         self.entry_price = float(entry_price) if entry_price else None
