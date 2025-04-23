@@ -11,6 +11,7 @@ import hmac
 import hashlib
 import time
 import base64
+import nacl.signing
 from typing import Dict, Any, Optional, List, Union
 from .auth import create_signature
 from config import API_URL, API_VERSION, DEFAULT_WINDOW
@@ -66,13 +67,21 @@ class BackpackAPIClient:
         return base64.b64encode(signature).decode()
 
     
-    def get_headers(self, api_type="rest", **kwargs):
-        if api_type == "instruction":
-            return self._generate_ed25519_headers(**kwargs)
-        else:
-            return self._generate_hmac_headers(**kwargs)
+    def get_headers(self, payload: Optional[dict] = None) -> dict:
+        timestamp = str(int(time.time() * 1000))
+        body = json.dumps(payload) if payload else ''
+        message = f"{timestamp}{body}"
+        signature = self.create_signature(message)
+
+        return {
+            "BP-API-KEY": self.api_key,
+            "BP-API-TIMESTAMP": timestamp,
+            "BP-API-SIGNATURE": signature,
+            "Content-Type": "application/json",
+        }
     
-    def _generate_ed25519_headers(self, instruction: str, params: dict = None) -> dict:
+    def _generate_ed25519_headers(self, instruction: str, params: dict):
+        self._sync_server_time() 
         """用 Ed25519 生成 instruction API headers"""
         timestamp = str(int(time.time() * 1000) + self.time_offset)
         window = "5000"
@@ -91,7 +100,7 @@ class BackpackAPIClient:
                 "X-API-KEY": self.api_key,
                 "X-SIGNATURE": signature,
                 "X-TIMESTAMP": timestamp,
-                "X-WINDOW": window
+                "X-WINDOW": "5000"
             }
         except Exception as e:
             logger.error(f"Ed25519 簽名生成失敗: {str(e)}")
@@ -253,7 +262,7 @@ class BackpackAPIClient:
                 "X-API-KEY": self.api_key,
                 "X-SIGNATURE": signature,
                 "X-TIMESTAMP": timestamp,
-                "X-WINDOW": window,
+                "X-WINDOW": "5000" 
             })
     
         # 添加查詢參數到URL
@@ -360,55 +369,40 @@ class BackpackAPIClient:
             params=params
         )
     
-    def submit_order(self,order_details: dict) -> dict:
+    def execute_order(self, order_details: dict) -> dict:
+        """執行下單請求"""
+        from .logger import logger  # 確保有 log
+
+        order_details['symbol'] = order_details['symbol'].replace('-', '_').upper()
+
+        # 市價單只能選一種數量類型
+        if order_details.get('orderType') == 'Market':
+            if 'quantity' in order_details and 'quoteQuantity' in order_details:
+                order_details.pop('quantity')  # 優先使用 quoteQuantity
+
+        # ✅ 調試日誌
+        logger.debug(f"📤 提交訂單 API Payload: {json.dumps(order_details, indent=2)}")
+
+        endpoint = f"/api/{API_VERSION}/order"
         try:
-            symbol = order_details["symbol"]
-            side = order_details["side"]
-            is_market = order_details.get("use_market_order", False)
-            quantity = order_details.get("quantity", None)
-            quote_quantity = order_details.get("quoteQuantity", None)
+            # ✅ 使用正確 payload 傳入 headers
+            headers = self.get_headers(payload=order_details)
 
-            payload = {
-                "symbol": symbol.upper().replace('-', '_'),
-                "side": side,
-                "type": "market" if is_market else "limit"
-            }
+            response = requests.post(
+                f"{self.base_url}{endpoint}",
+                json=order_details,
+                headers=headers
+            )
 
-            if is_market:
-                if quote_quantity is None:
-                    raise ValueError("市價單需提供 quoteQuantity")
-                payload["quoteQuantity"] = str(quote_quantity)
-            else:
-                if quantity is None:
-                    raise ValueError("限價單需提供 quantity")
-                payload["quantity"] = str(quantity)
-                payload["price"] = str(order_details.get("price"))
+            response_data = response.json()
 
-             # 🔐 產生簽名與 headers
-            request_path = "/api/v1/order"
-            timestamp = str(int(time.time() * 1000))
-            method = "POST"
-            body = json.dumps(payload)
-            signature = self._generate_hmac_headers(method, request_path, body)
-
-            headers = signature  # _generate_hmac_headers 直接回傳 headers dict
-
-            logger.info(f"📤 提交訂單 API Payload: {payload}")
-            print("🧾 headers:", headers)
-            
-            logger.debug(f"headers = {headers}")
-            logger.debug(f"POST {self.base_url + '/api/v1/order'} with payload = {payload}")
-
-            response = requests.post(f"{self.base_url}/api/v1/order", headers=headers, json=payload)
-            response.raise_for_status()
-            return response.json()
-
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"API 回應失敗: {response.status_code} - {response.text}")
-            return {"error": response.text}
+            # ✅ API 錯誤回報
+            if response.status_code != 200:
+                logger.error(f"API 回應失敗: {response.status_code} - {response.text}")
+            return response_data
 
         except Exception as e:
-            logger.error(f"订单执行失败: {e}")
+            logger.error(f"订单执行失败: {str(e)}")
             return {"error": str(e)}
 
 def get_ticker(symbol: str) -> float:
