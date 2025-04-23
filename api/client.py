@@ -130,39 +130,29 @@ class BackpackAPIClient:
         """统一交易对格式为 API 标准格式（大写短横线）"""
         return symbol.replace('_', '-').upper( )
         
-    def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> list:
+    def get_klines(self, symbol: str, interval: str = "1h", limit: int = 100) -> list:    
         """獲取K線數據（支持多時間週期）"""
         try:
-            # 時間間隔映射表
             interval_map = {
                 "1m": "1m", "5m": "5m", "15m": "15m",
                 "30m": "30m", "1h": "1H", "4h": "4H",
                 "1d": "1D", "1w": "1W", "1month": "1M"
             }
-        
-            # 構建請求參數
+
             params = {
                 "symbol": symbol.replace('-', '_'),
                 "interval": interval_map.get(interval, '1H'),
                 "limit": limit
             }
-        
-            # 生成簽名頭部
-            headers = self.get_headers(
-                api_type="rest",
-                method="GET",
-                path="/api/v1/klines",
-                body=json.dumps(params)
-            )
-        
-            # 發送請求
+
+            headers = self.get_headers()  # ✅ 不需再傳 api_type 等參數
+
             response = requests.get(
                 f"{self.base_url}/api/{API_VERSION}/klines",
                 params=params,
                 headers=headers
             )
-        
-            # 處理響應
+
             if response.status_code == 200:
                 return [{
                     'timestamp': int(kline[0]),
@@ -172,7 +162,10 @@ class BackpackAPIClient:
                     'close': float(kline[4]),
                     'volume': float(kline[5])
                 } for kline in response.json()]
-            return []
+            else:
+                logger.warning(f"K線獲取失敗: {response.status_code} - {response.text}")
+                return []
+
         except Exception as e:
             logger.error(f"K線數據獲取異常: {str(e)}")
             return []
@@ -319,15 +312,21 @@ class BackpackAPIClient:
     
 
     def get_balance(self, asset: str) -> dict:
-        """獲取餘額"""
-        headers = self.get_headers(
-            api_type="rest",
-            method="GET",
-            path="/api/v1/balance"
-        )
+        """獲取資產餘額"""
+        try:
+            headers = self.get_headers()  # ✅ 同樣改簡潔版
+            response = requests.get(f"{self.base_url}/api/{API_VERSION}/capital", headers=headers)
 
-        response = requests.get(f"{self.base_url}/api/v1/capital", headers=headers)
-        # ...處理響應...
+            if response.status_code == 200:
+                balances = response.json().get("data", [])
+                return next((b for b in balances if b["asset"] == asset), {})
+            else:
+                logger.warning(f"餘額獲取失敗: {response.status_code} - {response.text}")
+                return {}
+
+        except Exception as e:
+            logger.error(f"餘額查詢異常: {str(e)}")
+            return {}
 
           
 
