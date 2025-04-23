@@ -958,19 +958,23 @@ class MartingaleLongTrader:
 
                 order_details = {
                     "symbol": symbol,
-                    "side": side,
+                    "side": "Ask",
                     "orderType": "Market" if self.use_market_order else "Limit",
-                    "timeInForce": "IOC"
+                    "timeInForce": "GTC"
                 }
 
                 if self.use_market_order:
                     order_details["quoteQuantity"] = round(allocated_funds[idx], 6)
                 else:
                     order_details["quantity"] = quantity
-                    order_details["price"] = price
+                    order_details["price"] = str(price)
 
                 logger.info(f"📤 提交訂單 {idx+1}: {order_details}")
-                result = self.client.execute_order(order_details)
+                result = self.order_manager.submit_order(
+                    side="Bid",
+                    quantity=quantity,
+                    price=target_price
+                )
 
                 logger.debug(f"🧾 下單結果: {result}")
 
