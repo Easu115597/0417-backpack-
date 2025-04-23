@@ -15,7 +15,7 @@ import nacl.signing
 from typing import Dict, Any, Optional, List, Union
 from .auth import create_signature
 from config import API_URL, API_VERSION, DEFAULT_WINDOW
-from logger import setup_logger
+
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from .auth import create_hmac_signature
 
@@ -26,7 +26,7 @@ MARKET_ENDPOINT = "https://api.backpack.exchange/api/v1/markets"
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("SECRET_KEY")
 
-logger = setup_logger("api.client")
+
 BASE_URL = "https://api.backpack.exchange"
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,23 @@ class BackpackAPIClient:
         self.base_url = "https://api.backpack.exchange"
         self.time_offset = time_offset
         self._sync_server_time()  # 初始化時自動同步時間
+
+    def create_signature(self, message: str) -> str:
+        """使用 ED25519 私鑰簽署訊息"""
+        try:
+            # 解碼 base64 格式的 secret key
+            private_key_bytes = base64.b64decode(self.secret_key)
+
+            # 載入 ED25519 私鑰
+            private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+
+            # 對 message 簽名
+            signature = private_key.sign(message.encode())
+
+            # 將簽名轉成 base64 傳回
+            return base64.b64encode(signature).decode()
+        except Exception as e:
+            raise ValueError(f"❌ 簽名失敗: {e}")
        
     
     def _sync_server_time(self):
@@ -67,18 +84,7 @@ class BackpackAPIClient:
         return base64.b64encode(signature).decode()
 
     
-    def get_headers(self, payload: Optional[dict] = None) -> dict:
-        timestamp = str(int(time.time() * 1000))
-        body = json.dumps(payload) if payload else ''
-        message = f"{timestamp}{body}"
-        signature = self.create_signature(message)
-
-        return {
-            "BP-API-KEY": self.api_key,
-            "BP-API-TIMESTAMP": timestamp,
-            "BP-API-SIGNATURE": signature,
-            "Content-Type": "application/json",
-        }
+     
     
     def _generate_ed25519_headers(self, instruction: str, params: dict):
         self._sync_server_time() 
@@ -231,6 +237,11 @@ class BackpackAPIClient:
         """
         url = f"{self.base_url}{endpoint}"
         headers = {"Content-Type": "application/json"}
+
+        # 構建簽名信息（如需要）
+        if api_key and secret_key and instruction:
+            timestamp = str(int(time.time() * 1000))
+            window = DEFAULT_WINDOW
     
         # 構建簽名信息（如需要）
         if instruction:
@@ -252,7 +263,7 @@ class BackpackAPIClient:
                 return {"error": "簽名失敗"}
         
             headers.update({
-                "X-API-KEY": self.api_key,
+                "X-API-KEY": api_key,
                 "X-SIGNATURE": signature,
                 "X-TIMESTAMP": timestamp,
                 "X-WINDOW": "5000" 
