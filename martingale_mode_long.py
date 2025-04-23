@@ -923,28 +923,39 @@ class MartingaleLongTrader:
 
         return orders
 
-    def place_martingale_orders(self):
+    def place_martingale_orders(self):        
         """馬丁策略專用下單方法（整合版）"""
         try:
-            result = self.order_manager.submit_order(
-            side="Bid",
-            quantity=quantity,
-            price=target_price
-        )
+            self.cancel_existing_orders()
 
-            # 動態計算加倉參數
+            # ✅ 取得即時價格
             current_price = self.get_current_price()
             if not current_price:
                 logger.error("無法獲取當前價格，跳過下單")
                 return
 
+            # ✅ 資金分配
             allocated_funds = self.allocate_funds()
             logger.info(f"資金分配完成 | 各層金額: {allocated_funds}")
 
-            # 生成訂單列表
+            # ✅ 建立訂單列表
             orders = []
+            for layer in range(self.current_layer, self.max_layers):
+                target_price = current_price * (1 - self.price_step_down * layer)
+                target_price = round_to_tick_size(target_price, self.tick_size)
+
+                quantity = allocated_funds[layer] / target_price
+                quantity = Decimal(quantity).quantize(Decimal(f'1e-{self.base_precision}'), rounding=ROUND_DOWN)
+                quantity = float(quantity)
+
+                orders.append(("Bid", target_price, quantity))
+
+            logger.info(f"📌 準備下單 {len(orders)} 筆馬丁訂單...")
+
+            # ✅ 一筆一筆下單
             for idx, (side, price, quantity) in enumerate(orders):
                 symbol = self.symbol.replace("_", "-").upper()
+
                 order_details = {
                     "symbol": symbol,
                     "side": side,
@@ -953,17 +964,19 @@ class MartingaleLongTrader:
                 }
 
                 if self.use_market_order:
-                    order_details["quoteQuantity"] = round(self.allocated_funds[idx], 6)
+                    order_details["quoteQuantity"] = round(allocated_funds[idx], 6)
                 else:
                     order_details["quantity"] = quantity
                     order_details["price"] = price
 
-                logger.info(f"📤 提交訂單: {order_details}")
-                result = self.client.execute_order(order_details)  # ✅ 呼叫正確方法
+                logger.info(f"📤 提交訂單 {idx+1}: {order_details}")
+                result = self.client.execute_order(order_details)
+
+                logger.debug(f"🧾 下單結果: {result}")
 
                 if isinstance(result, dict) and result.get('status') == 'FILLED':
                     logger.info(f"✅ 層級{self.current_layer}下單成功 | {side} {quantity}@{price}")
-                    self._update_position(price, quantity, self.allocated_funds[self.current_layer])
+                    self._update_position(price, quantity, allocated_funds[self.current_layer])
                     self.current_layer += 1
                 else:
                     logger.warning(f"❌ 層級{self.current_layer}下單失敗 | 回應: {result.get('message') if isinstance(result, dict) else result}")
@@ -971,8 +984,8 @@ class MartingaleLongTrader:
             self._check_risk()
 
         except Exception as e:
-                logger.error(f"馬丁下單異常: {str(e)}")
-                self.current_layer = max(0, self.current_layer - 1)
+            logger.error(f"馬丁下單異常: {str(e)}")
+            self.current_layer = max(0, self.current_layer - 1)
 
            
     def _average_cost(self):
