@@ -13,8 +13,8 @@ from ws_client.client import BackpackWebSocket
 from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
 from logger import setup_logger
-
-
+from api.client import BackpackAPIClient
+from api.client import get_ticker 
 from decimal import Decimal, ROUND_DOWN
 
 logger = setup_logger("martingale_long")
@@ -22,10 +22,9 @@ logger = setup_logger("martingale_long")
 
 class MartingaleLongTrader:
     def __init__(
-        self,
-        client,
-        
-        
+        self,client,
+        api_key,
+        secret_key,        
         symbol: str,
         db_instance=None,
         total_capital_usdt: float = 100,
@@ -41,10 +40,10 @@ class MartingaleLongTrader:
         entry_price=None
         
     ):
-        self.client = client  # ✅ 儲存傳入的 client
-        self.client._sync_server_time()  # ⏰ 建議保留：同步 API 時間偏移
-        
-        self.symbol = symbol.upper().replace('-', '_')
+        self.api_key = api_key or os.getenv("API_KEY")
+        self.secret_key = secret_key or os.getenv("SECRET_KEY")
+        symbol = symbol.replace("-", "_")
+        self.symbol = symbol
         self.total_capital = total_capital_usdt
         self.price_step_down = price_step_down
         self.take_profit_pct = take_profit_pct
@@ -53,7 +52,9 @@ class MartingaleLongTrader:
         self.max_layers = max_layers
         self.multiplier = martingale_multiplier
         self.use_market_order = use_market_order
-        self.target_price = target_price                
+        self.target_price = target_price        
+        self.client = client
+        self.client._sync_server_time()  # 顯式同步時間
         self.duration = duration
         self.interval = 60
         self.entry_price = float(entry_price) if entry_price else None
@@ -141,10 +142,6 @@ class MartingaleLongTrader:
         # 等待WebSocket連接建立並進行初始化訂閲
         self._initialize_websocket()
 
-        # 載入交易統計和歷史交易
-        self._load_trading_stats()
-        self._load_recent_trades()
-
         logger.info(
             f"初始化增強型馬丁策略 | 總資金: {total_capital_usdt} | 最大層級: {max_layers}")
         logger.info(f"基礎資產: {self.base_asset}, 報價資產: {self.quote_asset}")
@@ -184,107 +181,7 @@ class MartingaleLongTrader:
         else:
             logger.warning(f"WebSocket連接建立超時，將在運行過程中繼續嘗試連接")
 
-    def _load_trading_stats(self):
-        """從數據庫加載交易統計數據"""
-        try:
-            today = datetime.now().strftime('%Y-%m-%d')
-
-            # 查詢今天的統計數據
-            stats = self.db.get_trading_stats(self.symbol, today)
-
-            if stats and len(stats) > 0:
-                stat = stats[0]
-                self.maker_buy_volume = stat['maker_buy_volume']
-                self.maker_sell_volume = stat['maker_sell_volume']
-                self.taker_buy_volume = stat['taker_buy_volume']
-                self.taker_sell_volume = stat['taker_sell_volume']
-                self.total_profit = stat['realized_profit']
-                self.total_fees = stat['total_fees']
-
-                logger.info(f"已從數據庫加載今日交易統計")
-                logger.info(
-                    f"Maker買入量: {
-                        self.maker_buy_volume}, Maker賣出量: {
-                        self.maker_sell_volume}")
-                logger.info(
-                    f"Taker買入量: {
-                        self.taker_buy_volume}, Taker賣出量: {
-                        self.taker_sell_volume}")
-                logger.info(
-                    f"已實現利潤: {
-                        self.total_profit}, 總手續費: {
-                        self.total_fees}")
-            else:
-                logger.info("今日無交易統計記錄，將創建新記錄")
-        except Exception as e:
-            logger.error(f"加載交易統計時出錯: {e}")
-
-    def _load_recent_trades(self):
-        """從數據庫加載歷史成交記錄"""
-        try:
-            # 獲取訂單歷史
-            trades = self.db.get_order_history(self.symbol, 1000)
-            trades_count = len(trades) if trades else 0
-
-            if trades_count > 0:
-                for side, quantity, price, maker, fee in trades:
-                    quantity = float(quantity)
-                    price = float(price)
-                    fee = float(fee)
-
-                    if side == 'Bid':  # 買入
-                        self.buy_trades.append((price, quantity))
-                        self.total_bought += quantity
-                        if maker:
-                            self.maker_buy_volume += quantity
-                        else:
-                            self.taker_buy_volume += quantity
-                    elif side == 'Ask':  # 賣出
-                        self.sell_trades.append((price, quantity))
-                        self.total_sold += quantity
-                        if maker:
-                            self.maker_sell_volume += quantity
-                        else:
-                            self.taker_sell_volume += quantity
-
-                    self.total_fees += fee
-
-                logger.info(f"已從數據庫載入 {trades_count} 條歷史成交記錄")
-                logger.info(
-                    f"總買入: {
-                        self.total_bought} {
-                        self.base_asset}, 總賣出: {
-                        self.total_sold} {
-                        self.base_asset}")
-                logger.info(
-                    f"Maker買入: {
-                        self.maker_buy_volume} {
-                        self.base_asset}, Maker賣出: {
-                        self.maker_sell_volume} {
-                        self.base_asset}")
-                logger.info(
-                    f"Taker買入: {
-                        self.taker_buy_volume} {
-                        self.base_asset}, Taker賣出: {
-                        self.taker_sell_volume} {
-                        self.base_asset}")
-
-                # 計算精確利潤
-                self.total_profit = self._calculate_db_profit()
-                logger.info(
-                    f"計算得出已實現利潤: {
-                        self.total_profit:.8f} {
-                        self.quote_asset}")
-                logger.info(f"總手續費: {self.total_fees:.8f} {self.quote_asset}")
-            else:
-                logger.info("數據庫中沒有歷史成交記錄，嘗試從API獲取")
-                self._load_trades_from_api()
-
-        except Exception as e:
-            logger.error(f"載入歷史成交記錄時出錯: {e}")
-            import traceback
-            traceback.print_exc()
-
+    
     def _load_trades_from_api(self):
         """從API加載歷史成交記錄"""
         
@@ -429,7 +326,7 @@ class MartingaleLongTrader:
                 return False
 
         return self.ws and self.ws.is_connected()
-
+    
     def _dynamic_size_adjustment(self):
         """動態調整倉位大小"""
         # 獲取不同時間週期的波動率
@@ -460,6 +357,7 @@ class MartingaleLongTrader:
         else:
             return 1.0
 
+    
     def allocate_funds(self):
         adjustment_factor = self._dynamic_size_adjustment()
         weights = [self.multiplier ** i for i in range(self.max_layers)]
@@ -951,155 +849,8 @@ class MartingaleLongTrader:
             logger.error(f"計算價格時出錯: {str(e)}")
             return None, None
 
-    def need_rebalance(self):
-        """判斷是否需要重平衡倉位"""
-        if self.total_bought == 0 and self.total_sold == 0:
-            return False
-        if self.total_bought == 0 or self.total_sold == 0:
-            return True
-
-        # 計算不平衡程度
-        imbalance_percentage = abs(
-            self.total_bought - self.total_sold) / max(self.total_bought, self.total_sold) * 100
-
-        # 獲取淨倉位和方向
-        net_position = self.total_bought - self.total_sold
-        position_direction = 1 if net_position > 0 else -1 if net_position < 0 else 0
-
-        logger.info(
-            f"當前倉位: 買入 {
-                self.total_bought} {
-                self.base_asset}, 賣出 {
-                self.total_sold} {
-                    self.base_asset}")
-        logger.info(f"不平衡百分比: {imbalance_percentage:.2f}%")
-
-        # 使用固定閾值
-        return imbalance_percentage > self.rebalance_threshold
-
-    def rebalance_position(self):
-        """重平衡倉位"""
-        logger.info("開始重新平衡倉位...")
-        self.check_ws_connection()
-
-        imbalance = self.total_bought - self.total_sold
-        bid_price, ask_price = self.get_market_depth()
-
-        if bid_price is None or ask_price is None:
-            current_price = self.get_current_price()
-            if current_price is None:
-                logger.error("無法獲取價格，無法重新平衡")
-                return
-            bid_price = current_price * 0.998
-            ask_price = current_price * 1.002
-
-        if imbalance > 0:
-            # 淨多頭，需要賣出
-            quantity = round_to_precision(imbalance, self.base_precision)
-            if quantity < self.min_order_size:
-                logger.info(
-                    f"不平衡量 {quantity} 低於最小訂單大小 {
-                        self.min_order_size}，不進行重新平衡")
-                return
-
-            # 設定賣出價格
-            price_factor = 1.0
-            sell_price = round_to_tick_size(
-                bid_price * price_factor, self.tick_size)
-            logger.info(
-                f"執行重新平衡: 賣出 {quantity} {
-                    self.base_asset} @ {sell_price}")
-
-            # 構建訂單
-            order_details = {
-                "orderType": "Market",
-                "quantity": str(quantity),
-                "side": "Ask",
-                "symbol": self.symbol,
-                "timeInForce": "GTC"}
-
-            # 嘗試執行訂單
-            result = self.client.submit_order(order_details)
-
-            # 處理可能的錯誤
-            if isinstance(result, dict) and "error" in result:
-                error_msg = str(result['error'])
-                logger.error(f"重新平衡賣單執行失敗: {error_msg}")
-
-                # 如果因為訂單會立即成交而失敗，嘗試不使用postOnly
-                if "POST_ONLY_TAKER" in error_msg or "Order would immediately match" in error_msg:
-                    logger.info("嘗試使用非postOnly訂單進行重新平衡...")
-                    order_details.pop("postOnly", None)
-                    result = self.client.submit_order(order_details)
-
-                    if isinstance(result, dict) and "error" in result:
-                        logger.error(f"非postOnly賣單執行失敗: {result['error']}")
-                    else:
-                        logger.info(f"非postOnly賣單執行成功，價格: {sell_price}")
-                        # 記錄這是一個重平衡訂單
-                        if 'id' in result:
-                            self.db.record_rebalance_order(
-                                result['id'], self.symbol)
-            else:
-                logger.info(f"重新平衡賣單已提交，作為maker")
-                # 記錄這是一個重平衡訂單
-                if 'id' in result:
-                    self.db.record_rebalance_order(result['id'], self.symbol)
-
-        elif imbalance < 0:
-            # 淨空頭，需要買入
-            quantity = round_to_precision(abs(imbalance), self.base_precision)
-            if quantity < self.min_order_size:
-                logger.info(
-                    f"不平衡量 {quantity} 低於最小訂單大小 {
-                        self.min_order_size}，不進行重新平衡")
-                return
-
-            # 設定買入價格
-            price_factor = 1.0
-            buy_price = round_to_tick_size(
-                ask_price * price_factor, self.tick_size)
-            logger.info(
-                f"執行重新平衡: 買入 {quantity} {
-                    self.base_asset} @ {buy_price}")
-
-            # 構建訂單
-            order_details = {
-                "orderType": "Market",
-                "quantity": str(quantity),
-                "side": "Bid",
-                "symbol": self.symbol,
-                "timeInForce": "GTC"}
-
-            # 嘗試執行訂單
-            result = self.client.submit_order(order_details)
-
-            # 處理可能的錯誤
-            if isinstance(result, dict) and "error" in result:
-                error_msg = str(result['error'])
-                logger.error(f"重新平衡買單執行失敗: {error_msg}")
-
-                # 如果因為訂單會立即成交而失敗，嘗試不使用postOnly
-                if "POST_ONLY_TAKER" in error_msg or "Order would immediately match" in error_msg:
-                    logger.info("嘗試使用非postOnly訂單進行重新平衡...")
-                    order_details.pop("postOnly", None)
-                    result = self.client.submit_order(order_details)
-
-                    if isinstance(result, dict) and "error" in result:
-                        logger.error(f"非postOnly買單執行失敗: {result['error']}")
-                    else:
-                        logger.info(f"非postOnly買單執行成功，價格: {buy_price}")
-                        # 記錄這是一個重平衡訂單
-                        if 'id' in result:
-                            self.db.record_rebalance_order(
-                                result['id'], self.symbol)
-            else:
-                logger.info(f"重平衡買單已提交，作為maker")
-                # 記錄這是一個重平衡訂單
-                if 'id' in result:
-                    self.db.record_rebalance_order(result['id'], self.symbol)
-
-        logger.info("倉位重新平衡完成")
+    
+    
 
 
 
@@ -1186,62 +937,38 @@ class MartingaleLongTrader:
 
             # 生成訂單列表
             orders = []
-            for layer in range(self.current_layer, self.max_layers):
-                target_price = current_price * (1 - self.price_step_down * layer)
-                target_price = round_to_tick_size(target_price, self.tick_size)
-
-                quantity = allocated_funds[layer] / target_price
-                # 使用Decimal進行高精度計算
-                quantity = Decimal(quantity).quantize(Decimal(f'1e-{self.base_precision}'), rounding=ROUND_DOWN)
-                quantity = float(quantity)
-                orders.append(('Bid', target_price, quantity))
-                
-                 
-            logger.info(f"📌 進行馬丁下單: {len(orders)} 筆訂單")
-
-            # 執行下單
             for idx, (side, price, quantity) in enumerate(orders):
+                symbol = self.symbol.replace("_", "-").upper()
                 order_details = {
-                    "symbol": self.symbol.replace("_", "-"),
-                    "side": "Bid",
+                    "symbol": symbol,
+                    "side": side,
                     "orderType": "Market" if self.use_market_order else "Limit",
-                    "timeInForce": "IOC",
-                    "use_market_order": self.use_market_order
+                    "timeInForce": "IOC"
                 }
 
                 if self.use_market_order:
-                    order_details["quoteQuantity"] = round(allocated_funds[idx], 6)
+                    order_details["quoteQuantity"] = round(self.allocated_funds[idx], 6)
                 else:
                     order_details["quantity"] = quantity
                     order_details["price"] = price
 
                 logger.info(f"📤 提交訂單: {order_details}")
-                self.client.submit_order(order_details)
-
-
-                logger.info(f"📤 提交訂單: {order_details}")
-
-                result = self.client.submit_order(order_details)
-
-                logger.debug(f"下單回傳結果: {result} | 類型: {type(result)}")
+                result = self.client.execute_order(order_details)  # ✅ 呼叫正確方法
 
                 if isinstance(result, dict) and result.get('status') == 'FILLED':
-                    logger.info(
-                        f"✅ 層級{self.current_layer}下單成功 | {side} {quantity}@{price}")
-                    self._update_position(
-                        price, quantity, self.allocated_funds[self.current_layer])
+                    logger.info(f"✅ 層級{self.current_layer}下單成功 | {side} {quantity}@{price}")
+                    self._update_position(price, quantity, self.allocated_funds[self.current_layer])
                     self.current_layer += 1
                 else:
-                    logger.warning(
-                        f"❌ 層級{self.current_layer}下單失敗 | 回應: {result.get('message') if isinstance(result, dict) else result}")
+                    logger.warning(f"❌ 層級{self.current_layer}下單失敗 | 回應: {result.get('message') if isinstance(result, dict) else result}")
 
-            # 風控檢查
             self._check_risk()
 
         except Exception as e:
-            logger.error(f"馬丁下單異常: {str(e)}")
-            self.current_layer = max(0, self.current_layer - 1)  # 回退層級
+                logger.error(f"馬丁下單異常: {str(e)}")
+                self.current_layer = max(0, self.current_layer - 1)
 
+           
     def _average_cost(self):
         """計算平均持倉成本"""
         if not self.buy_trades:
@@ -1456,7 +1183,7 @@ class MartingaleLongTrader:
         }
     
         # 執行平倉
-        result = self.client.submit_order(order_details)
+        result = self.client.execute_order(order_details)
         if 'error' in result:
             logger.error(f"平倉失敗: {result['error']}")
         else:
@@ -1596,8 +1323,7 @@ class MartingaleLongTrader:
 
             if today_stats and len(today_stats) > 0:
                 stat = today_stats[0]
-                maker_buy = stat['maker_buy_volume']
-                maker_sell = stat['maker_sell_volume']
+                
                 taker_buy = stat['taker_buy_volume']
                 taker_sell = stat['taker_sell_volume']
                 profit = stat['realized_profit']
@@ -1611,12 +1337,11 @@ class MartingaleLongTrader:
                     (maker_buy + maker_sell) / total_volume * 100) if total_volume > 0 else 0
 
                 logger.info(f"\n今日統計 ({today}):")
-                logger.info(f"Maker買入量: {maker_buy} {self.base_asset}")
-                logger.info(f"Maker賣出量: {maker_sell} {self.base_asset}")
+                
                 logger.info(f"Taker買入量: {taker_buy} {self.base_asset}")
                 logger.info(f"Taker賣出量: {taker_sell} {self.base_asset}")
                 logger.info(f"總成交量: {total_volume} {self.base_asset}")
-                logger.info(f"Maker佔比: {maker_percentage:.2f}%")
+                
                 logger.info(f"平均價差: {avg_spread:.4f}%")
                 logger.info(f"波動率: {volatility:.4f}%")
                 logger.info(f"毛利潤: {profit:.8f} {self.quote_asset}")
@@ -1672,14 +1397,7 @@ class MartingaleLongTrader:
             logger.info(
                 f"\n本次執行統計 (從 {
                     self.session_start_time.strftime('%Y-%m-%d %H:%M:%S')} 開始):")
-            logger.info(
-                f"Maker買入量: {
-                    self.session_maker_buy_volume} {
-                    self.base_asset}")
-            logger.info(
-                f"Maker賣出量: {
-                    self.session_maker_sell_volume} {
-                    self.base_asset}")
+            
             logger.info(
                 f"Taker買入量: {
                     self.session_taker_buy_volume} {
@@ -1847,12 +1565,7 @@ class MartingaleLongTrader:
                     f"買入量: {session_buy_volume} {
                         self.base_asset}, 賣出量: {session_sell_volume} {
                         self.base_asset}")
-                logger.info(
-                    f"Maker買入: {
-                        self.session_maker_buy_volume} {
-                        self.base_asset}, Maker賣出: {
-                        self.session_maker_sell_volume} {
-                        self.base_asset}")
+                
                 logger.info(
                     f"Taker買入: {
                         self.session_taker_buy_volume} {
@@ -1900,12 +1613,7 @@ class MartingaleLongTrader:
                     f"買入量: {session_buy_volume} {
                         self.base_asset}, 賣出量: {session_sell_volume} {
                         self.base_asset}")
-                logger.info(
-                    f"Maker買入: {
-                        self.session_maker_buy_volume} {
-                        self.base_asset}, Maker賣出: {
-                        self.session_maker_sell_volume} {
-                        self.base_asset}")
+                
                 logger.info(
                     f"Taker買入: {
                         self.session_taker_buy_volume} {
@@ -1949,12 +1657,7 @@ class MartingaleLongTrader:
                     f"買入量: {session_buy_volume} {
                         self.base_asset}, 賣出量: {session_sell_volume} {
                         self.base_asset}")
-                logger.info(
-                    f"Maker買入: {
-                        self.session_maker_buy_volume} {
-                        self.base_asset}, Maker賣出: {
-                        self.session_maker_sell_volume} {
-                        self.base_asset}")
+                
                 logger.info(
                     f"Taker買入: {
                         self.session_taker_buy_volume} {
