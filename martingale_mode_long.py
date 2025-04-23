@@ -16,6 +16,7 @@ from logger import setup_logger
 from api.client import BackpackAPIClient
 from api.client import get_ticker 
 from decimal import Decimal, ROUND_DOWN
+from trading.order_manager import OrderManager
 
 logger = setup_logger("martingale_long")
 
@@ -58,6 +59,7 @@ class MartingaleLongTrader:
         self.duration = duration
         self.interval = 60
         self.entry_price = float(entry_price) if entry_price else None
+        self.order_manager = OrderManager(self.client, self.symbol, self.use_market_order)
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -924,7 +926,11 @@ class MartingaleLongTrader:
     def place_martingale_orders(self):
         """馬丁策略專用下單方法（整合版）"""
         try:
-            self.cancel_existing_orders()
+            result = self.order_manager.submit_order(
+            side="Bid",
+            quantity=quantity,
+            price=target_price
+        )
 
             # 動態計算加倉參數
             current_price = self.get_current_price()
