@@ -60,7 +60,7 @@ def parse_arguments():
     martingale_group.add_argument('--multiplier', type=float, default=1.3, help='馬丁加碼倍率')
     martingale_group.add_argument('--use_market_order', action='store_true', help='是否使用市價初始下單')
     martingale_group.add_argument('--target_price', type=float,default=None, help='指定首次入場目標價格')
-    
+    martingale_group.add_argument('--runtime', type=int, default=-1, help='馬丁策略運行時間（秒），-1 表示無限運行直到止盈/止損')
     return parser.parse_args()
 
 def main():
