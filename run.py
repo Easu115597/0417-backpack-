@@ -60,7 +60,7 @@ def parse_arguments():
     martingale_group.add_argument('--multiplier', type=float, default=1.3, help='馬丁加碼倍率')
     martingale_group.add_argument('--use_market_order', action='store_true', help='是否使用市價初始下單')
     martingale_group.add_argument('--target_price', type=float,default=None, help='指定首次入場目標價格')
-
+    
     return parser.parse_args()
 
 def main():
@@ -100,6 +100,8 @@ def main():
             sys.exit(1)
 
     elif args.martingale:
+        
+        base_asset, quote_asset = args.symbol.split("_") 
         try:
             from strategies.martingale_mode_long import MartingaleLongTrader
 
@@ -110,6 +112,8 @@ def main():
                 api_key=api_key,
                 secret_key=secret_key,
                 symbol=args.symbol,
+                base_asset=base_asset,
+                quote_asset=quote_asset,
                 total_capital_usdt=args.total_capital,
                 price_step_down=args.price_step_down,
                 take_profit_pct=args.take_profit_pct,
