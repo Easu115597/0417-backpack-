@@ -25,17 +25,19 @@ class MartingaleLongTrader:
         api_key, 
         secret_key, 
         symbol, 
+        base_asset, 
+        quote_asset,
         db_instance=None,
         total_capital_usdt=100,
         price_step_down=0.008,
         take_profit_pct=0.012,
         stop_loss_pct=-0.33,
-        current_layer = 0,
+        current_layer=0,
         max_layers=5,
         martingale_multiplier=1.3,
         use_market_order=True,
         target_price=None
-    ):
+        ):
         self.api_key = api_key
         self.secret_key = secret_key
         self.symbol = symbol 
@@ -48,7 +50,12 @@ class MartingaleLongTrader:
         self.multiplier = martingale_multiplier
         self.use_market_order = use_market_order
         self.target_price = target_price
-        
+        self.maker_buy_volume = 0
+        self.maker_sell_volume = 0
+        self.taker_buy_volume = 0
+        self.taker_sell_volume = 0
+        self.base_asset = base_asset
+        self.quote_asset = quote_asset
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -75,8 +82,7 @@ class MartingaleLongTrader:
         self.tick_size = float(self.market_limits['tick_size'])
         
         # 交易量統計
-        self.maker_buy_volume = 0
-        self.maker_sell_volume = 0        
+                
         self.total_fees = 0
         
         
@@ -112,7 +118,7 @@ class MartingaleLongTrader:
         self._load_trading_stats()
         self._load_recent_trades()
         
-        logger.info(f"初始化增強型馬丁策略 | 總資金: {total_capital_usdt} | 最大層級: {max_levels}")
+        logger.info(f"初始化增強型馬丁策略 | 總資金: {total_capital_usdt} | 最大層級: {max_layers}")
         logger.info(f"基礎資產: {self.base_asset}, 報價資產: {self.quote_asset}")
         logger.info(f"基礎精度: {self.base_precision}, 報價精度: {self.quote_precision}")
         logger.info(f"最小訂單大小: {self.min_order_size}, 價格步長: {self.tick_size}")
