@@ -11,7 +11,7 @@ from api.auth import create_signature
 from api.client import get_order_book
 from utils.helpers import calculate_volatility
 from logger import setup_logger
-from api.client import BackpackAPIClient
+
 
 logger = setup_logger("backpack_ws")
 
@@ -42,7 +42,7 @@ class BackpackWebSocket:
         self.order_updates = []
         self.historical_prices = []  # 儲存歷史價格用於計算波動率
         self.max_price_history = 100  # 最多儲存的價格數量
-        self.client = BackpackAPIClient(api_key, secret_key)
+        
 
         # 重連相關參數
         self.auto_reconnect = auto_reconnect
@@ -67,45 +67,7 @@ class BackpackWebSocket:
         # 添加代理参数
         self.proxy = proxy
 
-    def initialize_orderbook(self):
-        """通過REST API獲取訂單簿初始快照"""
-        try:
-            # 使用REST API獲取完整訂單簿
-            order_book = self.client.make_request(
-                method="GET",
-                endpoint="/api/v1/depth",
-                instruction="orderbookQuery",
-                params={"symbol": self.symbol, "limit": 100}
-            )  # 增加深度
-            if isinstance(order_book, dict) and "error" in order_book:
-                logger.error(f"初始化訂單簿失敗: {order_book['error']}")
-                return False
-            
-            # 重置並填充orderbook數據結構
-            self.orderbook = {
-                "bids": [[float(price), float(quantity)] for price, quantity in order_book.get('bids', [])],
-                "asks": [[float(price), float(quantity)] for price, quantity in order_book.get('asks', [])]
-            }
-            
-            # 按價格排序
-            self.orderbook["bids"] = sorted(self.orderbook["bids"], key=lambda x: x[0], reverse=True)
-            self.orderbook["asks"] = sorted(self.orderbook["asks"], key=lambda x: x[0])
-            
-            logger.info(f"訂單簿初始化成功: {len(self.orderbook['bids'])} 個買單, {len(self.orderbook['asks'])} 個賣單")
-            
-            # 初始化最高買價和最低賣價
-            if self.orderbook["bids"]:
-                self.bid_price = self.orderbook["bids"][0][0]
-            if self.orderbook["asks"]:
-                self.ask_price = self.orderbook["asks"][0][0]
-            if self.bid_price and self.ask_price:
-                self.last_price = (self.bid_price + self.ask_price) / 2
-                self.add_price_to_history(self.last_price)
-            
-            return True
-        except Exception as e:
-            logger.error(f"初始化訂單簿時出錯: {e}")
-            return False
+    
     
     def add_price_to_history(self, price):
         """添加價格到歷史記錄用於計算波動率"""
@@ -296,8 +258,7 @@ class BackpackWebSocket:
             if "bookTicker" in self.subscriptions or not self.subscriptions:
                 self.subscribe_bookTicker()
             
-            if "depth" in self.subscriptions or not self.subscriptions:
-                self.subscribe_depth()
+            
         
         # 重新訂閲私有訂單更新流
         for sub in self.subscriptions:
@@ -324,55 +285,38 @@ class BackpackWebSocket:
             logger.error(f"訂閲bookTicker失敗: {e}")
             return False
     
-    def subscribe_depth(self):
-        """訂閲深度信息"""
-        logger.info(f"訂閲 {self.symbol} 的深度信息...")
+        
+    def private_subscribe(self, stream: str) -> bool:
+        """訂閱私有數據流 (需簽名驗證)"""
         if not self.connected or not self.ws:
-            logger.warning("WebSocket未連接，無法訂閲深度信息")
+            logger.warning("WebSocket未連接，無法訂閱私有流")
             return False
-            
-        try:
-            message = {
-                "method": "SUBSCRIBE",
-                "params": [f"depth.{self.symbol}"]
-            }
-            self.ws.send(json.dumps(message))
-            if "depth" not in self.subscriptions:
-                self.subscriptions.append("depth")
-            return True
-        except Exception as e:
-            logger.error(f"訂閲深度信息失敗: {e}")
-            return False
-    
-    def private_subscribe(self, stream):
-        """訂閲私有數據流"""
-        if not self.connected or not self.ws:
-            logger.warning("WebSocket未連接，無法訂閲私有數據流")
-            return False
-            
+
         try:
             timestamp = str(int(time.time() * 1000))
             window = DEFAULT_WINDOW
-            sign_message = f"instruction=subscribe&timestamp={timestamp}&window={window}"
-            signature = create_signature(self.secret_key, sign_message)
-            
+            message_to_sign = f"instruction=subscribe&timestamp={timestamp}&window={window}"
+            signature = create_signature(self.secret_key, message_to_sign)
+
             if not signature:
-                logger.error("簽名創建失敗，無法訂閲私有數據流")
+                logger.error("❌ 簽名創建失敗，無法訂閱私有流")
                 return False
-            
-            message = {
+
+            payload = {
                 "method": "SUBSCRIBE",
                 "params": [stream],
                 "signature": [self.api_key, signature, timestamp, window]
             }
-            
-            self.ws.send(json.dumps(message))
-            logger.info(f"已訂閲私有數據流: {stream}")
+
+            self.ws.send(json.dumps(payload))
+            logger.info(f"✅ 已訂閱私有數據流: {stream}")
+
             if stream not in self.subscriptions:
                 self.subscriptions.append(stream)
+
             return True
         except Exception as e:
-            logger.error(f"訂閲私有數據流失敗: {e}")
+            logger.error(f"❌ 訂閱私有數據流失敗: {e}")
             return False
     
     def on_message(self, ws, message):
