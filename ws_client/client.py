@@ -67,7 +67,10 @@ class BackpackWebSocket:
         # 添加代理参数
         self.proxy = proxy
 
-    
+    def initialize_orderbook(self):
+        """佔位函數（或用於未來擴展）"""
+        logger.info("📄 跳過初始化訂單簿（馬丁策略不使用）")
+        return True
     
     def add_price_to_history(self, price):
         """添加價格到歷史記錄用於計算波動率"""
