@@ -15,7 +15,7 @@ from ws_client.client import BackpackWebSocket
 from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
 from logger import setup_logger
-from api.client import BackpackAPIClient
+
 
 logger = setup_logger("martingale_long")
 
@@ -48,28 +48,20 @@ class MartingaleLongTrader:
         self.multiplier = martingale_multiplier
         self.use_market_order = use_market_order
         self.target_price = target_price
-        self.client = BackpackAPIClient(api_key, secret_key)  # 使用統一客戶端
-        self.client._sync_server_time()  # 顯式同步時間
+        
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
         
         # 統計屬性
         self.session_start_time = datetime.now()
-        self.session_buy_trades = []
-        self.session_sell_trades = []
-        self.session_fees = 0.0
-        self.session_maker_buy_volume = 0.0
-        self.session_maker_sell_volume = 0.0
-        self.session_taker_buy_volume = 0.0
-        self.session_taker_sell_volume = 0.0
-        self.session_entry_prices = []
+        self.session_fees = 0.0        
         self.session_quantities = []
         self.session_level = 0
         self.session_average_price = 0.0
         self.session_total_invested = 0.0
-        self.session_base_asset = symbol.split('-')[0]
-        self.session_quote_asset = symbol.split('-')[1]
+        self.session_maker_buy_volume = 0.0
+        self.session_maker_sell_volume = 0.0
 
         # 初始化市場限制
         self.market_limits = get_market_limits(symbol)
@@ -84,10 +76,9 @@ class MartingaleLongTrader:
         
         # 交易量統計
         self.maker_buy_volume = 0
-        self.maker_sell_volume = 0
-        self.taker_buy_volume = 0
-        self.taker_sell_volume = 0
+        self.maker_sell_volume = 0        
         self.total_fees = 0
+        
         
         # 建立WebSocket連接
         self.ws = BackpackWebSocket(api_key, secret_key, symbol, self.on_ws_message, auto_reconnect=True)
@@ -136,21 +127,15 @@ class MartingaleLongTrader:
             wait_time += 0.5
         
         if self.ws.connected:
-            logger.info("WebSocket連接已建立，初始化數據流...")
+            logger.info("WebSocket連接已建立，初始化行情和訂單更新...")
             
-            # 初始化訂單簿
-            orderbook_initialized = self.ws.initialize_orderbook()
-            
-            # 訂閲深度流和行情數據
-            if orderbook_initialized:
-                depth_subscribed = self.ws.subscribe_depth()
-                ticker_subscribed = self.ws.subscribe_bookTicker()
-                
-                if depth_subscribed and ticker_subscribed:
-                    logger.info("數據流訂閲成功!")
-            
-            # 訂閲私有訂單更新流
-            self.subscribe_order_updates()
+            ticker_subscribed = self.ws.subscribe_bookTicker()
+            order_subscribed = self.subscribe_order_updates()
+
+            if ticker_subscribed and order_subscribed:
+                logger.info("✅ WebSocket 訂閲成功 (價格與訂單更新)")
+            else:
+                logger.warning("⚠️ WebSocket 訂閲部分失敗")
         else:
             logger.warning(f"WebSocket連接建立超時，將在運行過程中繼續嘗試連接")
     
@@ -343,8 +328,8 @@ class MartingaleLongTrader:
                     logger.info("WebSocket重新連接成功")
                     
                     # 重新初始化
-                    self.ws.initialize_orderbook()
-                    self.ws.subscribe_depth()
+                    
+                    
                     self.ws.subscribe_bookTicker()
                     self.subscribe_order_updates()
                 else:
@@ -998,45 +983,48 @@ class MartingaleLongTrader:
         return orders
 
     def place_martingale_orders(self):
-        """执行马丁策略下单"""
-        try:
-            self.cancel_existing_orders()
-            orders = self.generate_martingale_orders()
-            
-            for side, price, quantity in orders:
-                # 动态调整订单量
-                adjusted_qty = self._adjust_quantity(quantity, side)
-                if adjusted_qty < self.min_order_size:
-                    continue
-                
-                # 构建订单
-                order_details = {
-                    "symbol": self.symbol,
-                    "side": side,
-                    "orderType": "Limit",
-                    "price": str(price),
-                    "quantity": str(adjusted_qty),
-                    "timeInForce": "GTC",
-                    "postOnly": True
-                }
-                
-                # 执行下单
-                result = execute_order(self.api_key, self.secret_key, order_details)
-                
-                # 处理结果
-                if 'id' in result:
-                    logger.info(f"马丁订单成功 {side} {adjusted_qty}@{price}")
-                    self._record_order(side, price, adjusted_qty)
-                    self.current_layer += 0.5  # 每边订单算0.5层
-                else:
-                    logger.warning(f"订单失败: {result.get('message')}")
-                    
-            # 风控检查
-            self._check_risk()
-            
-        except Exception as e:
-            logger.error(f"马丁下单异常: {str(e)}")
-            self.current_layer = 0  # 重置层级
+        """馬丁策略的下單方法（模仿做市下單邏輯）"""
+        self.check_ws_connection()
+        self.cancel_existing_orders()
+
+        current_price = self.get_current_price()
+        if not current_price:
+            logger.error("無法獲取當前價格，跳過下單")
+            return
+
+        allocated_funds = self.allocate_funds()
+        logger.info(f"資金分配完成 | 各層金額: {allocated_funds}")
+
+        orders_placed = 0
+
+        for layer in range(self.max_layers):
+            target_price = current_price * (1 - self.price_step_down * layer)
+            target_price = round_to_tick_size(target_price, self.tick_size)
+
+            quote_amount = allocated_funds[layer]
+            quantity = round_to_precision(quote_amount / target_price, self.base_precision)
+
+            # 建構下單參數
+            order_details = {
+                "orderType": "Limit" if not self.use_market_order else "Market",
+                "price": str(target_price) if not self.use_market_order else None,
+                "quantity": str(quantity),
+                "side": "Bid",
+                "symbol": self.symbol.replace("_", "-").upper(),
+                "timeInForce": "IOC",
+            }
+
+            logger.info(f"📤 提交第 {layer+1} 層訂單: {order_details}")
+            result = execute_order(self.api_key, self.secret_key, order_details)
+
+            if isinstance(result, dict) and "error" in result:
+                logger.warning(f"❌ 層 {layer} 下單失敗: {result['error']}")
+            else:
+                logger.info(f"✅ 層 {layer} 下單成功: {result}")
+                self.orders_placed += 1
+                orders_placed += 1
+
+        logger.info(f"📊 本次共下單 {orders_placed} 層馬丁訂單")
 
     def _adjust_quantity(self, quantity, side):
         """根据余额动态调整订单量"""
@@ -1389,11 +1377,7 @@ class MartingaleLongTrader:
     
     def _ensure_data_streams(self):
         """確保所有必要的數據流訂閲都是活躍的"""
-        # 檢查深度流訂閲
-        if "depth" not in self.ws.subscriptions:
-            logger.info("重新訂閲深度數據流...")
-            self.ws.initialize_orderbook()  # 重新初始化訂單簿
-            self.ws.subscribe_depth()
+       
         
         # 檢查行情數據訂閲
         if "bookTicker" not in self.ws.subscriptions:
@@ -1405,7 +1389,7 @@ class MartingaleLongTrader:
             logger.info("重新訂閲私有訂單更新流...")
             self.subscribe_order_updates()
     
-    def run(self, duration_seconds=3600, interval_seconds=60):
+    def run(self, duration_seconds=-1, interval_seconds=60):
         """執行馬丁策略"""
         logger.info(f"開始運行馬丁策略: {self.symbol}")
         logger.info(f"運行時間: {duration_seconds} 秒, 間隔: {interval_seconds} 秒")
@@ -1429,13 +1413,10 @@ class MartingaleLongTrader:
             # 先確保 WebSocket 連接可用
             connection_status = self.check_ws_connection()
             if connection_status:
-                # 初始化訂單簿和數據流
-                if not self.ws.orderbook["bids"] and not self.ws.orderbook["asks"]:
-                    self.ws.initialize_orderbook()
+                
                 
                 # 檢查並確保所有數據流訂閲
-                if "depth" not in self.ws.subscriptions:
-                    self.ws.subscribe_depth()
+                
                 if "bookTicker" not in self.ws.subscriptions:
                     self.ws.subscribe_bookTicker()
                 if f"account.orderUpdate.{self.symbol}" not in self.ws.subscriptions:
@@ -1463,7 +1444,7 @@ class MartingaleLongTrader:
                     self.rebalance_position()
                 
                 # 下限價單
-                self.place_limit_orders()
+                self.place_martingale_orders()
                 
                 # 估算利潤
                 self.estimate_profit()
