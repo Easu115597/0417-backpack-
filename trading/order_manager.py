@@ -10,10 +10,10 @@ class OrderManager:
         symbol = self.symbol.replace("_", "-")
 
         order_payload = {
-            "symbol": symbol,
-            "side": side,
             "orderType": "Market" if self.use_market_order else "Limit",
-            "timeInForce": "IOC" if not self.use_market_order else None
+            "symbol": self.symbol,
+            "side": side,
+            "timeInForce": "GTC" if not self.use_market_order else None
         }
 
         if self.use_market_order:
