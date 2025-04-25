@@ -932,10 +932,18 @@ class MartingaleLongTrader:
             logger.error(f"馬丁下單異常: {e}")
         
     def check_exit_condition(self):
-        current_price = self.get_current_price()
-        avg_price = self.calculate_avg_entry_price()
-        pnl = (current_price - avg_price) / avg_price
+        if not self.filled_orders:
+            logger.warning("⚠️ 尚無成交單，跳過出場判斷。")
+            return False
 
+        current_price = self.get_current_price()
+        avg_price = self.calculate_avg_price()
+
+        if avg_price == 0:
+            logger.warning("⚠️ 平均價格為 0，可能為錯誤狀態，跳過出場。")
+            return False
+
+        pnl = (current_price - avg_price) / avg_price
         print(f"🚦 當前價格: {current_price}, 平均成本: {avg_price}, PnL: {pnl:.4f}")
 
         if pnl >= self.take_profit_pct:
@@ -944,6 +952,7 @@ class MartingaleLongTrader:
         elif pnl <= self.stop_loss_pct:
             print("🛑 達成止損條件，結束交易")
             return True
+
         return False
     
     def execute_first_entry(self):
