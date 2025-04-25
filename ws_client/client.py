@@ -69,8 +69,28 @@ class BackpackWebSocket:
 
     def initialize_orderbook(self):
         """佔位函數（或用於未來擴展）"""
-        logger.info("📄 跳過初始化訂單簿（馬丁策略不使用）")
-        return True
+        try:
+            # 使用REST API獲取完整訂單簿
+            order_book = get_order_book(self.symbol, 100)  # 增加深度
+            if isinstance(order_book, dict) and "error" in order_book:
+                logger.error(f"初始化訂單簿失敗: {order_book['error']}")
+                return False
+            
+            # 重置並填充orderbook數據結構
+            self.orderbook = {
+                "bids": [[float(price), float(quantity)] for price, quantity in order_book.get('bids', [])],
+                "asks": [[float(price), float(quantity)] for price, quantity in order_book.get('asks', [])]
+            }
+            
+            # 按價格排序
+            self.orderbook["bids"] = sorted(self.orderbook["bids"], key=lambda x: x[0], reverse=True)
+            self.orderbook["asks"] = sorted(self.orderbook["asks"], key=lambda x: x[0])
+            
+            logger.info(f"訂單簿初始化成功: {len(self.orderbook['bids'])} 個買單, {len(self.orderbook['asks'])} 個賣單")
+            return True
+        except Exception as e:                
+            logger.info("📄 跳過初始化訂單簿（馬丁策略不使用）")
+            return False
     
     def add_price_to_history(self, price):
         """添加價格到歷史記錄用於計算波動率"""
