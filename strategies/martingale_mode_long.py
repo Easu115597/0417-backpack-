@@ -36,7 +36,8 @@ class MartingaleLongTrader:
         max_layers=5,
         martingale_multiplier=1.3,
         use_market_order=True,
-        target_price=None
+        target_price=None,
+        runtime=-1
         ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -56,6 +57,7 @@ class MartingaleLongTrader:
         self.taker_sell_volume = 0
         self.base_asset = base_asset
         self.quote_asset = quote_asset
+        self.runtime = runtime
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -348,18 +350,18 @@ class MartingaleLongTrader:
         return self.ws and self.ws.is_connected()
     
     def _dynamic_size_adjustment(self):
-        volatility = calculate_historical_volatility(self.symbol, period=24)
-        if volatility > self.volatility_threshold:
-            return 0.7
+        #volatility = calculate_historical_volatility(self.symbol, period=24)
+        #if volatility > self.volatility_threshold:
+        #    return 0.7
         return 1.0
 
     def allocate_funds(self):
         adjustment_factor = self._dynamic_size_adjustment()
-        weights = [self.multiplier ** i for i in range(self.max_levels)]
+        weights = [self.multiplier ** i for i in range(self.max_layers)]
         total_weight = sum(weights)
         return [
             (self.total_capital * (self.multiplier ** i) / total_weight) * adjustment_factor 
-            for i in range(self.max_levels)
+            for i in range(self.max_layers)
         ]
 
     def on_ws_message(self, stream, data):
@@ -1017,7 +1019,7 @@ class MartingaleLongTrader:
                 "quantity": str(quantity),
                 "side": "Bid",
                 "symbol": self.symbol.replace("_", "-").upper(),
-                "timeInForce": "IOC",
+                "timeInForce": "GTC",
             }
 
             logger.info(f"📤 提交第 {layer+1} 層訂單: {order_details}")
@@ -1068,9 +1070,19 @@ class MartingaleLongTrader:
         current_price = self.get_current_price()
         position = self.total_bought - self.total_sold
         return (current_price - avg_cost) * position if current_price else 0
+    
+    def _execute_strategy_cycle(self):
+        """執行單次策略循環，包括價格判斷與下單邏輯"""
+        current_price = self.get_current_price()
+        if not current_price:
+            logger.warning("無法獲取當前價格，跳過此循環")
+            return
 
+        # 這邊可以依據邏輯判斷是否需要下單
+        logger.info(f"📈 當前價格: {current_price}")
 
-
+        # TODO: 實作馬丁策略下單邏輯
+        self.place_martingale_orders()
    
     
     def cancel_existing_orders(self):
@@ -1414,7 +1426,21 @@ class MartingaleLongTrader:
         iteration = 0
         last_report_time = start_time
         report_interval = 300  # 5分鐘打印一次報表
-        
+        while True:
+            self._execute_strategy_cycle()
+
+
+            # 條件 1：時間限制（runtime > 0）
+            if self.runtime > 0 and time.time() - start_time >= self.runtime:
+                logger.info("🛑 已達指定運行時間，結束策略")
+                break
+
+            # 條件 2：止盈止損
+            if self._check_take_profit() or self._check_stop_loss():
+                logger.info("🛑 觸發止盈或止損，結束策略")
+                break
+
+            time.sleep(self.interval)
         try:
             # 先確保 WebSocket 連接可用
             connection_status = self.check_ws_connection()
