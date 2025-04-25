@@ -24,11 +24,12 @@ logger = setup_logger("martingale_long")
 
 class MartingaleLongTrader:
     def __init__(
-        self, 
-        api_key, 
-        secret_key, 
-        symbol, 
-        base_asset, 
+        self,
+        api_key,
+        secret_key,
+        symbol,
+        entry_type,
+        base_asset,
         quote_asset,
         db_instance=None,
         total_capital_usdt=100,
@@ -40,8 +41,10 @@ class MartingaleLongTrader:
         martingale_multiplier=1.3,
         use_market_order=True,
         target_price=None,
-        runtime=None,
-        entry_price=None
+        runtime=None,        
+        entry_pric=None,
+        
+        
         ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -64,9 +67,12 @@ class MartingaleLongTrader:
         self.quote_asset = base_quote[1]
         self.runtime = runtime if runtime is not None else -1
         self.start_time = time.time()
-        self.entry_price = target_price if target_price else self.get_current_price()
-        if not self.entry_price:
-            raise ValueError("無法獲取初始入場價格")
+        self.entry_price = None
+        self.entry_type = entry_type
+        
+        self.open_orders = []
+        self.filled_orders = []
+        self.current_position = 0
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -710,6 +716,16 @@ class MartingaleLongTrader:
             return float(ticker['lastPrice'])
         return price
     
+    def calculate_quantity(self, price, level=0):
+        base_qty = self.total_capital / price
+        multiplier = self.multiplier ** level
+        return base_qty * multiplier
+    
+    def calculate_avg_entry_price(self):
+        total_cost = sum(order['price'] * order['quantity'] for order in self.filled_orders)
+        total_qty = sum(order['quantity'] for order in self.filled_orders)
+        return total_cost / total_qty if total_qty > 0 else 0
+    
     def get_market_depth(self):
         """獲取市場深度（優先使用WebSocket數據）"""
         self.check_ws_connection()
@@ -799,143 +815,7 @@ class MartingaleLongTrader:
             logger.error(f"計算價格時出錯: {str(e)}")
             return None, None
     
-    def need_rebalance(self):
-        """判斷是否需要重平衡倉位"""
-        if self.total_bought == 0 and self.total_sold == 0:
-            return False
-        if self.total_bought == 0 or self.total_sold == 0:
-            return True
-        
-        # 計算不平衡程度
-        imbalance_percentage = abs(self.total_bought - self.total_sold) / max(self.total_bought, self.total_sold) * 100
-        
-        # 獲取淨倉位和方向
-        net_position = self.total_bought - self.total_sold
-        position_direction = 1 if net_position > 0 else -1 if net_position < 0 else 0
-        
-        logger.info(f"當前倉位: 買入 {self.total_bought} {self.base_asset}, 賣出 {self.total_sold} {self.base_asset}")
-        logger.info(f"不平衡百分比: {imbalance_percentage:.2f}%")
-        
-        # 使用固定閾值
-        return imbalance_percentage > self.rebalance_threshold
-    
-    def rebalance_position(self):
-        """重平衡倉位"""
-        logger.info("開始重新平衡倉位...")
-        self.check_ws_connection()
-        
-        imbalance = self.total_bought - self.total_sold
-        bid_price, ask_price = self.get_market_depth()
-        
-        if bid_price is None or ask_price is None:
-            current_price = self.get_current_price()
-            if current_price is None:
-                logger.error("無法獲取價格，無法重新平衡")
-                return
-            bid_price = current_price * 0.998
-            ask_price = current_price * 1.002
-        
-        if imbalance > 0:
-            # 淨多頭，需要賣出
-            quantity = round_to_precision(imbalance, self.base_precision)
-            if quantity < self.min_order_size:
-                logger.info(f"不平衡量 {quantity} 低於最小訂單大小 {self.min_order_size}，不進行重新平衡")
-                return
-            
-            # 設定賣出價格
-            price_factor = 1.0
-            sell_price = round_to_tick_size(bid_price * price_factor, self.tick_size)
-            logger.info(f"執行重新平衡: 賣出 {quantity} {self.base_asset} @ {sell_price}")
-            
-            # 構建訂單
-            order_details = {
-                "orderType": "Limit",
-                "price": str(sell_price),
-                "quantity": str(quantity),
-                "side": "Ask",
-                "symbol": self.symbol,
-                "timeInForce": "GTC",
-                "postOnly": True
-            }
-            
-            # 嘗試執行訂單
-            result = execute_order(self.api_key, self.secret_key, order_details)
-            
-            # 處理可能的錯誤
-            if isinstance(result, dict) and "error" in result:
-                error_msg = str(result['error'])
-                logger.error(f"重新平衡賣單執行失敗: {error_msg}")
-                
-                # 如果因為訂單會立即成交而失敗，嘗試不使用postOnly
-                if "POST_ONLY_TAKER" in error_msg or "Order would immediately match" in error_msg:
-                    logger.info("嘗試使用非postOnly訂單進行重新平衡...")
-                    order_details.pop("postOnly", None)
-                    result = execute_order(self.api_key, self.secret_key, order_details)
-                    
-                    if isinstance(result, dict) and "error" in result:
-                        logger.error(f"非postOnly賣單執行失敗: {result['error']}")
-                    else:
-                        logger.info(f"非postOnly賣單執行成功，價格: {sell_price}")
-                        # 記錄這是一個重平衡訂單
-                        if 'id' in result:
-                            self.db.record_rebalance_order(result['id'], self.symbol)
-            else:
-                logger.info(f"重新平衡賣單已提交，作為maker")
-                # 記錄這是一個重平衡訂單
-                if 'id' in result:
-                    self.db.record_rebalance_order(result['id'], self.symbol)
-            
-        elif imbalance < 0:
-            # 淨空頭，需要買入
-            quantity = round_to_precision(abs(imbalance), self.base_precision)
-            if quantity < self.min_order_size:
-                logger.info(f"不平衡量 {quantity} 低於最小訂單大小 {self.min_order_size}，不進行重新平衡")
-                return
-            
-            # 設定買入價格
-            price_factor = 1.0
-            buy_price = round_to_tick_size(ask_price * price_factor, self.tick_size)
-            logger.info(f"執行重新平衡: 買入 {quantity} {self.base_asset} @ {buy_price}")
-            
-            # 構建訂單
-            order_details = {
-                "orderType": "Limit",
-                "price": str(buy_price),
-                "quantity": str(quantity),
-                "side": "Bid",
-                "symbol": self.symbol,
-                "timeInForce": "GTC",
-                "postOnly": True
-            }
-            
-            # 嘗試執行訂單
-            result = execute_order(self.api_key, self.secret_key, order_details)
-            
-            # 處理可能的錯誤
-            if isinstance(result, dict) and "error" in result:
-                error_msg = str(result['error'])
-                logger.error(f"重新平衡買單執行失敗: {error_msg}")
-                
-                # 如果因為訂單會立即成交而失敗，嘗試不使用postOnly
-                if "POST_ONLY_TAKER" in error_msg or "Order would immediately match" in error_msg:
-                    logger.info("嘗試使用非postOnly訂單進行重新平衡...")
-                    order_details.pop("postOnly", None)
-                    result = execute_order(self.api_key, self.secret_key, order_details)
-                    
-                    if isinstance(result, dict) and "error" in result:
-                        logger.error(f"非postOnly買單執行失敗: {result['error']}")
-                    else:
-                        logger.info(f"非postOnly買單執行成功，價格: {buy_price}")
-                        # 記錄這是一個重平衡訂單
-                        if 'id' in result:
-                            self.db.record_rebalance_order(result['id'], self.symbol)
-            else:
-                logger.info(f"重平衡買單已提交，作為maker")
-                # 記錄這是一個重平衡訂單
-                if 'id' in result:
-                    self.db.record_rebalance_order(result['id'], self.symbol)
-        
-        logger.info("倉位重新平衡完成")
+       
     
     def subscribe_order_updates(self):
         """訂閲訂單更新流"""
@@ -1051,22 +931,64 @@ class MartingaleLongTrader:
         except Exception as e:
             logger.error(f"馬丁下單異常: {e}")
         
-    def _check_exit_conditions(self):
+    def check_exit_condition(self):
         current_price = self.get_current_price()
-        if not current_price:
-            return False
+        avg_price = self.calculate_avg_entry_price()
+        pnl = (current_price - avg_price) / avg_price
 
-        avg_entry = self.session_average_price if self.session_average_price else current_price
-        pnl = (current_price - avg_entry) / avg_entry
-        logger.info(f"🚦 當前價格: {current_price}, 平均成本: {avg_entry}, PnL: {pnl:.4f}")
+        print(f"🚦 當前價格: {current_price}, 平均成本: {avg_price}, PnL: {pnl:.4f}")
 
         if pnl >= self.take_profit_pct:
-            logger.info(f"🎯 達成止盈條件，結束交易")
+            print("🎯 達成止盈條件，結束交易")
             return True
         elif pnl <= self.stop_loss_pct:
-            logger.warning(f"🛑 達成止損條件，結束交易")
+            print("🛑 達成止損條件，結束交易")
             return True
         return False
+    
+    def execute_first_entry(self):
+        current_price = self.get_current_price()
+
+        # 根據 entry_type 設定價格與訂單型態
+
+        if self.entry_type == "manual":
+            price = self.entry_price
+            order_type = "limit"
+        elif self.entry_type == "market":
+            order_type = "market"
+        elif self.entry_type == "offset":
+            price = current_price * (1 - self.price_step_down)
+            order_type = "limit"
+        else:
+            raise ValueError(f"Unknown entry_type: {self.entry_type}")
+        
+        # 計算下單數量
+
+        qty = self.calculate_quantity(price)
+         # 下單
+        order_response = self.place_martingale_orders()
+        print("First order placed:", order_response)
+
+        
+        # 判斷下單狀態
+        if order_response is None:
+            logger.error("❌ 首單下單失敗: API無響應")
+            return
+        # 市價單專用判斷
+        if order_type == "market":
+            if order_response.get("status") == "Filled":
+                logger.info(f"✅ 市價單成交: {order_response.get('id')}")
+                self.entry_price = float(order_response.get("price"))
+            else:
+                logger.warning(f"❌ 市價單未成交: {order_response}")
+
+        # 限價單專用判斷
+        else:
+            if order_response.get("status") in ["New", "PartiallyFilled"]:
+                logger.info(f"✅ 限價單掛單成功: {order_response.get('id')}")
+            else:
+                logger.warning(f"❌ 限價單掛單失敗: {order_response}")
+        
     
     def _check_take_profit(self):
         current_price = self.get_current_price()
@@ -1468,8 +1390,11 @@ class MartingaleLongTrader:
         iteration = 0
         last_report_time = start_time
         report_interval = 300  # 5分鐘打印一次報表
-        while True:
-            self._execute_strategy_cycle()
+        self.execute_first_entry()
+        level = 1
+        while True:            
+            price = self.get_current_price()
+            print(f"Current market price: {price}")
 
 
             # 條件 1：時間限制（runtime > 0）
@@ -1478,21 +1403,38 @@ class MartingaleLongTrader:
                 break
 
             # 條件 2：止盈止損
-            if self._check_take_profit() or self._check_stop_loss():
-                logger.info("🛑 觸發止盈或止損，結束策略")
+            if self.check_exit_condition():
+                total_qty = sum(order['quantity'] for order in self.filled_orders)
+                target_price = price
+                sell_order = self.api.place_martingale_orders(
+                    symbol=self.symbol,
+                    side="sell",
+                    price=target_price,
+                    quantity=total_qty,
+                    order_type="market" if self.use_market_order else "limit",
+                    use_market=self.use_market_order
+                )
+                print("Exit order placed:", sell_order)
                 break
 
-            time.sleep(self.interval)
+            # 模擬價格下跌並掛買單
+            next_price = self.entry_price * (1 - self.price_step_down * level)
+            if not self.entry_price:
+                self.entry_price = price 
+            qty = self.calculate_quantity(next_price, level)
+            order = self.place_martingale_orders()
+            print(f"Layer {level} order placed at {next_price}")
+            self.filled_orders.append({'price': next_price, 'quantity': qty})
+
+            level += 1
+            time.sleep(self.poll_interval)
+
+            
         try:
-            # 先確保 WebSocket 連接可用
-            connection_status = self.check_ws_connection()
-            if connection_status:
-                # 初始化訂單簿和數據流
-                if not self.ws.orderbook["bids"] and not self.ws.orderbook["asks"]:
-                    self.ws.initialize_orderbook()
-                
+            connection_status = self.check_ws_connection()              
                 # 檢查並確保所有數據流訂閲
-                
+            if connection_status:
+                # 初始化訂單簿和數據流    
                 if "bookTicker" not in self.ws.subscriptions:
                     self.ws.subscribe_bookTicker()
                 if f"account.orderUpdate.{self.symbol}" not in self.ws.subscriptions:
@@ -1505,7 +1447,7 @@ class MartingaleLongTrader:
                 logger.info(f"時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # 檢查連接並在必要時重連
-                connection_status = self.check_ws_connection()
+               
                 
                 # 如果連接成功，檢查並確保所有流訂閲
                 if connection_status:
@@ -1515,10 +1457,7 @@ class MartingaleLongTrader:
                 # 檢查訂單成交情況
                 self.check_order_fills()
                 
-                # 檢查是否需要重平衡倉位
-                if self.need_rebalance():
-                    self.rebalance_position()
-                
+                               
                 # 下限價單
                 self.place_martingale_orders()
                 
