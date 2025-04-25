@@ -3,6 +3,8 @@
 """
 import time
 import threading
+import logging
+import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Union, Any
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +16,7 @@ from api.client import (
 from ws_client.client import BackpackWebSocket
 from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
+from strategies.volatility import calculate_historical_volatility
 from logger import setup_logger
 
 
@@ -33,11 +36,12 @@ class MartingaleLongTrader:
         take_profit_pct=0.012,
         stop_loss_pct=-0.33,
         current_layer=0,
-        max_layers=5,
+        max_layers=3,
         martingale_multiplier=1.3,
         use_market_order=True,
         target_price=None,
-        runtime=-1
+        runtime=None,
+        entry_price=None
         ):
         self.api_key = api_key
         self.secret_key = secret_key
@@ -55,9 +59,14 @@ class MartingaleLongTrader:
         self.maker_sell_volume = 0
         self.taker_buy_volume = 0
         self.taker_sell_volume = 0
-        self.base_asset = base_asset
-        self.quote_asset = quote_asset
-        self.runtime = runtime
+        base_quote = self.symbol.upper().split("_")
+        self.base_asset = base_quote[0]
+        self.quote_asset = base_quote[1]
+        self.runtime = runtime if runtime is not None else -1
+        self.start_time = time.time()
+        self.entry_price = target_price if target_price else self.get_current_price()
+        if not self.entry_price:
+            raise ValueError("無法獲取初始入場價格")
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -73,7 +82,7 @@ class MartingaleLongTrader:
         self.session_maker_sell_volume = 0.0
 
         # 初始化市場限制
-        self.market_limits = get_market_limits(symbol)
+        self.market_limits = get_market_limits(self.symbol)
         if not self.market_limits:
             raise ValueError(f"無法獲取 {symbol} 的市場限制")
         
@@ -89,7 +98,7 @@ class MartingaleLongTrader:
         
         
         # 建立WebSocket連接
-        self.ws = BackpackWebSocket(api_key, secret_key, symbol, self.on_ws_message, auto_reconnect=True)
+        self.ws = BackpackWebSocket(symbol=self.symbol, api_key=self.api_key, secret_key=self.secret_key)
         self.ws.connect()
         
         # 跟蹤活躍訂單
@@ -128,24 +137,23 @@ class MartingaleLongTrader:
     
     def _initialize_websocket(self):
         """等待WebSocket連接建立並進行初始化訂閲"""
-        wait_time = 0
-        max_wait_time = 10
-        while not self.ws.connected and wait_time < max_wait_time:
-            time.sleep(0.5)
-            wait_time += 0.5
-        
-        if self.ws.connected:
-            logger.info("WebSocket連接已建立，初始化行情和訂單更新...")
-            
-            ticker_subscribed = self.ws.subscribe_bookTicker()
-            order_subscribed = self.subscribe_order_updates()
-
-            if ticker_subscribed and order_subscribed:
-                logger.info("✅ WebSocket 訂閲成功 (價格與訂單更新)")
+        logger.info("WebSocket連接已建立，初始化行情和訂單更新...")
+        self.ws.subscribe_bookTicker()
+        success = self.ws.private_subscribe(f"account.orderUpdate.{self.symbol}")
+        if not success:            
+            logger.warning("訂閲訂單更新失敗，嘗試重試... (1/3)")
+            for i in range(2, 4):
+                time.sleep(1)
+                success = self.ws.private_subscribe(f"account.orderUpdate.{self.symbol}")
+                if success:
+                    break
             else:
+                logger.error("在 3 次嘗試後仍無法訂閲訂單更新")
                 logger.warning("⚠️ WebSocket 訂閲部分失敗")
-        else:
-            logger.warning(f"WebSocket連接建立超時，將在運行過程中繼續嘗試連接")
+
+
+
+        
     
     def _load_trading_stats(self):
         """從數據庫加載交易統計數據"""
@@ -350,19 +358,22 @@ class MartingaleLongTrader:
         return self.ws and self.ws.is_connected()
     
     def _dynamic_size_adjustment(self):
-        #volatility = calculate_historical_volatility(self.symbol, period=24)
-        #if volatility > self.volatility_threshold:
-        #    return 0.7
+        try:
+            volatility = calculate_historical_volatility(self.symbol, period=24)
+            if volatility is not None:
+                return max(0.5, min(1.5, 1 + (volatility - 0.02)))
+        except Exception as e:
+            logger.warning(f"波動率調整失敗，使用預設: {e}")
         return 1.0
 
     def allocate_funds(self):
         adjustment_factor = self._dynamic_size_adjustment()
-        weights = [self.multiplier ** i for i in range(self.max_layers)]
-        total_weight = sum(weights)
-        return [
-            (self.total_capital * (self.multiplier ** i) / total_weight) * adjustment_factor 
-            for i in range(self.max_layers)
-        ]
+        base = 1
+        levels = [base * (self.multiplier ** i) for i in range(self.max_layers)]
+        total_units = sum(levels)
+        allocation = [(self.total_capital * (units / total_units)) * adjustment_factor for units in levels]
+        logger.info(f"資金分配完成 | 各層金額: {allocation}")
+        return allocation
 
     def on_ws_message(self, stream, data):
         """處理WebSocket消息回調"""
@@ -994,45 +1005,76 @@ class MartingaleLongTrader:
         """馬丁策略的下單方法（模仿做市下單邏輯）"""
         self.check_ws_connection()
         self.cancel_existing_orders()
+        try:
 
+            current_price = self.get_current_price()
+            if not current_price:
+                logger.error("無法獲取當前價格，跳過下單")
+                return
+
+            allocated_funds = self.allocate_funds()
+            logger.info(f"資金分配完成 | 各層金額: {allocated_funds}")
+
+            orders = []
+
+            for level in range(self.max_layers):
+                price = round(current_price * (1 - self.price_step_down * level), self.quote_precision)
+                amount = allocated_funds[level] / price
+                amount = max(self.min_order_size, round_to_precision(amount, self.base_precision))
+                orders.append((price, amount))
+
+            for idx, (price, quantity) in enumerate(orders):
+                order_details = {
+                    "orderType": "Limit",
+                    "price": str(price),
+                    "quantity": str(quantity),
+                    "side": "Bid",
+                    "symbol": self.symbol,
+                    "timeInForce": "GTC",
+                    "postOnly": True
+                }
+
+                if self.use_market_order:
+                    order_details["quoteQuantity"] = round(allocated_funds[idx], self.quote_precision)
+                else:
+                    order_details["quantity"] = round(quantity, self.base_precision)
+                    order_details["price"] = round(price, self.quote_precision)
+
+                logger.info(f"📤 提交訂單 {idx+1}: {order_details}")
+                result = execute_order(self.api_key, self.secret_key, order_details)
+
+                if isinstance(result, dict) and result.get("status") in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
+    
+                    logger.info(f"✅ 層 {idx+1} 下單成功: {result}")
+                else:
+                    logger.warning(f"❌ 層 {idx+1} 下單失敗: {result}")
+        except Exception as e:
+            logger.error(f"馬丁下單異常: {e}")
+        
+    def _check_exit_conditions(self):
         current_price = self.get_current_price()
         if not current_price:
-            logger.error("無法獲取當前價格，跳過下單")
-            return
+            return False
 
-        allocated_funds = self.allocate_funds()
-        logger.info(f"資金分配完成 | 各層金額: {allocated_funds}")
+        avg_entry = self.session_average_price if self.session_average_price else current_price
+        pnl = (current_price - avg_entry) / avg_entry
+        logger.info(f"🚦 當前價格: {current_price}, 平均成本: {avg_entry}, PnL: {pnl:.4f}")
 
-        orders_placed = 0
+        if pnl >= self.take_profit_pct:
+            logger.info(f"🎯 達成止盈條件，結束交易")
+            return True
+        elif pnl <= self.stop_loss_pct:
+            logger.warning(f"🛑 達成止損條件，結束交易")
+            return True
+        return False
+    
+    def _check_take_profit(self):
+        current_price = self.get_current_price()
+        return current_price >= self.entry_price * (1 + self.take_profit_pct)
 
-        for layer in range(self.max_layers):
-            target_price = current_price * (1 - self.price_step_down * layer)
-            target_price = round_to_tick_size(target_price, self.tick_size)
-
-            quote_amount = allocated_funds[layer]
-            quantity = round_to_precision(quote_amount / target_price, self.base_precision)
-
-            # 建構下單參數
-            order_details = {
-                "orderType": "Limit" if not self.use_market_order else "Market",
-                "price": str(target_price) if not self.use_market_order else None,
-                "quantity": str(quantity),
-                "side": "Bid",
-                "symbol": self.symbol.replace("_", "-").upper(),
-                "timeInForce": "GTC",
-            }
-
-            logger.info(f"📤 提交第 {layer+1} 層訂單: {order_details}")
-            result = execute_order(self.api_key, self.secret_key, order_details)
-
-            if isinstance(result, dict) and "error" in result:
-                logger.warning(f"❌ 層 {layer} 下單失敗: {result['error']}")
-            else:
-                logger.info(f"✅ 層 {layer} 下單成功: {result}")
-                self.orders_placed += 1
-                orders_placed += 1
-
-        logger.info(f"📊 本次共下單 {orders_placed} 層馬丁訂單")
+    def _check_stop_loss(self):
+        current_price = self.get_current_price()
+        return current_price <= self.entry_price * (1 + self.stop_loss_pct)
 
     def _adjust_quantity(self, quantity, side):
         """根据余额动态调整订单量"""
@@ -1410,7 +1452,7 @@ class MartingaleLongTrader:
     def run(self, duration_seconds=-1, interval_seconds=60):
         """執行馬丁策略"""
         logger.info(f"開始運行馬丁策略: {self.symbol}")
-        logger.info(f"運行時間: {duration_seconds} 秒, 間隔: {interval_seconds} 秒")
+        logger.info(f"運行時間: {self.runtime if self.runtime else '不限'} 秒, 間隔: 60 秒")
         
         # 重置本次執行的統計數據
         self.session_start_time = datetime.now()
@@ -1445,7 +1487,9 @@ class MartingaleLongTrader:
             # 先確保 WebSocket 連接可用
             connection_status = self.check_ws_connection()
             if connection_status:
-                
+                # 初始化訂單簿和數據流
+                if not self.ws.orderbook["bids"] and not self.ws.orderbook["asks"]:
+                    self.ws.initialize_orderbook()
                 
                 # 檢查並確保所有數據流訂閲
                 
