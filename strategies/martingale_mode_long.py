@@ -18,7 +18,7 @@ from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
 from strategies.volatility import calculate_historical_volatility
 from logger import setup_logger
-
+from trading.order_manager import OrderManager
 
 logger = setup_logger("martingale_long")
 
@@ -31,6 +31,7 @@ class MartingaleLongTrader:
         entry_type,
         base_asset,
         quote_asset,
+        entry_price=None,
         db_instance=None,
         total_capital_usdt=100,
         price_step_down=0.008,
@@ -42,7 +43,7 @@ class MartingaleLongTrader:
         use_market_order=True,
         target_price=None,
         runtime=None,        
-        entry_pric=None,
+        
         
         
         ):
@@ -69,7 +70,6 @@ class MartingaleLongTrader:
         self.start_time = time.time()
         self.entry_price = None
         self.entry_type = entry_type
-        
         self.open_orders = []
         self.filled_orders = []
         self.current_position = 0
@@ -911,7 +911,7 @@ class MartingaleLongTrader:
                     "side": "Bid",
                     "symbol": self.symbol,
                     "timeInForce": "GTC",
-                    "postOnly": True
+                    "postOnly": True,
                 }
 
                 if self.use_market_order:
@@ -957,48 +957,85 @@ class MartingaleLongTrader:
     
     def execute_first_entry(self):
         current_price = self.get_current_price()
+        retries = 3
+        delay_seconds = 5
 
-        # 根據 entry_type 設定價格與訂單型態
+        for attempt in range(1, retries + 1):
+            logger.info(f"📤 嘗試第 {attempt} 次提交首單...")
 
-        if self.entry_type == "manual":
-            price = self.entry_price
-            order_type = "limit"
-        elif self.entry_type == "market":
-            order_type = "market"
-        elif self.entry_type == "offset":
-            price = current_price * (1 - self.price_step_down)
-            order_type = "limit"
-        else:
-            raise ValueError(f"Unknown entry_type: {self.entry_type}")
-        
-        # 計算下單數量
+            self.cancel_existing_orders()
 
-        qty = self.calculate_quantity(price)
-         # 下單
-        order_response = self.place_martingale_orders()
-        print("First order placed:", order_response)
-
-        
-        # 判斷下單狀態
-        if order_response is None:
-            logger.error("❌ 首單下單失敗: API無響應")
-            return
-        # 市價單專用判斷
-        if order_type == "market":
-            if order_response.get("status") == "Filled":
-                logger.info(f"✅ 市價單成交: {order_response.get('id')}")
-                self.entry_price = float(order_response.get("price"))
+            # 計算價格與訂單型態
+            if self.entry_type == "manual":
+                price = self.entry_price
+                order_type = "limit"
+            elif self.entry_type == "market":
+                price = current_price  # 為了 qty 計算
+                order_type = "market"
+            elif self.entry_type == "offset":
+                price = current_price * (1 - self.price_step_down)
+                order_type = "limit"
             else:
-                logger.warning(f"❌ 市價單未成交: {order_response}")
+                raise ValueError(f"Unknown entry_type: {self.entry_type}")
 
-        # 限價單專用判斷
-        else:
-            if order_response.get("status") in ["New", "PartiallyFilled"]:
-                logger.info(f"✅ 限價單掛單成功: {order_response.get('id')}")
+            qty = self.calculate_quantity(price)
+
+            try:
+                order_response = self.place_order(order_type, price, qty)
+            except Exception as e:
+                logger.warning(f"⚠️ 首單下單錯誤: {e}")
+                order_response = None
+
+            # 驗證下單是否成功
+            if order_response and order_response.get("status") in ["New", "PartiallyFilled", "Filled"]:
+                self.entry_price = float(order_response.get("price", price))
+                logger.info(f"✅ 首單下單成功，entry_price 設為 {self.entry_price}")
+                return
+
+            logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，{delay_seconds} 秒後重試...")
+            time.sleep(delay_seconds)
+
+        # 所有 retry 失敗 → 市價備案
+        logger.warning("⚠️ 首單所有嘗試失敗，使用市價單進場")
+        fallback_qty = self.calculate_quantity(current_price)
+        try:
+            fallback_order = self.place_order("market", current_price, fallback_qty)
+            if fallback_order and fallback_order.get("status") == "Filled":
+                self.entry_price = float(fallback_order.get("price", current_price))
+                logger.info(f"✅ 市價單備案成功，entry_price 設為 {self.entry_price}")
             else:
-                logger.warning(f"❌ 限價單掛單失敗: {order_response}")
-        
+                logger.error(f"❌ 市價單備案仍失敗: {fallback_order}")
+        except Exception as e:
+            logger.error(f"❌ 市價備案下單錯誤: {e}")
+
+
+    def place_order(self, order_type, price, quantity):
+        order_details = {
+            "symbol": self.symbol,
+            "side": "Bid",
+            "orderType": order_type.capitalize(),  # "Limit" or "Market"
+            "timeInForce": "GTC",
+        }
+
+        if self.use_market_order or order_type.lower() == "market":
+            # quoteQuantity = 總金額（會成交多少 USDC）
+            quote_quantity = round(quantity * price, self.quote_precision)
+            order_details["quoteQuantity"] = quote_quantity
+        else:
+            # Limit 單要設定 price + quantity + postOnly
+            order_details["quantity"] = round(quantity, self.base_precision)
+            order_details["price"] = round(price, self.quote_precision)
+            order_details["postOnly"] = True
+        try:
+            result = execute_order(self.api_key, self.secret_key, order_details)
+            return result
+        except Exception as e:
+            logger.error(f"❌ 下單失敗: {e}")
+            return None
+
     
+
+
     def _check_take_profit(self):
         current_price = self.get_current_price()
         return current_price >= self.entry_price * (1 + self.take_profit_pct)
@@ -1427,6 +1464,9 @@ class MartingaleLongTrader:
                 break
 
             # 模擬價格下跌並掛買單
+            if self.entry_price is None:
+                logger.error("❌ 無有效的 entry_price，跳過價格計算")
+                return
             next_price = self.entry_price * (1 - self.price_step_down * level)
             if not self.entry_price:
                 self.entry_price = price 
