@@ -132,21 +132,33 @@ def execute_order(api_key, secret_key, order_details):
     
     # 提取所有參數用於簽名
     params = {
-        "orderType": order_details["orderType"],
-        "price": order_details.get("price", "0"),
-        "quantity": order_details["quantity"],
-        "side": order_details["side"],
         "symbol": order_details["symbol"],
-        "timeInForce": order_details.get("timeInForce", "GTC")
+        "side": order_details["side"],
+        "orderType": order_details["orderType"],
     }
-    
+
+    if order_details["orderType"] == "Market":
+        # 市價單，只帶 quoteQuantity
+        params["quoteQuantity"] = order_details["quoteQuantity"]
+        
+    else:
+        # 限價單，帶 price, quantity, timeInForce, postOnly
+        params["price"] = order_details("price","0")
+        params["quantity"] = order_details["quantity"]
+        params["timeInForce"] = order_details.get("timeInForce", "GTC")
+        params["postOnly"] = str(order_details.get("postOnly", False)).lower()
+        
+
     # 添加可選參數
-    for key in ["postOnly", "reduceOnly", "clientId", "quoteQuantity", 
-                "autoBorrow", "autoLendRedeem", "autoBorrowRepay", "autoLend"]:
-        if key in order_details:
-            params[key] = str(order_details[key]).lower() if isinstance(order_details[key], bool) else str(order_details[key])
-    
-    return make_request("POST", endpoint, api_key, secret_key, instruction, params, order_details)
+    for key in ["reduceOnly", "clientId", "autoBorrow", "autoLendRedeem", "autoBorrowRepay", "autoLend"]:
+        if key in order_details and key not in params:
+            value = order_details[key]
+            params[key] = str(value).lower() if isinstance(value, bool) else str(value)
+
+    print(f"make_request 現在是：{make_request}")
+    print(f"make_request 類型：{type(make_request)}")
+
+    return make_request("POST", endpoint, api_key, secret_key, instruction, params, params)
 
 def get_open_orders(api_key, secret_key, symbol=None):
     """獲取未成交訂單"""
