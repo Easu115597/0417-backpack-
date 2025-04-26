@@ -73,6 +73,7 @@ class MartingaleLongTrader:
         self.open_orders = []
         self.filled_orders = []
         self.current_position = 0
+        self.poll_interval = 5
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -882,54 +883,47 @@ class MartingaleLongTrader:
         return orders
 
     def place_martingale_orders(self):
-        """馬丁策略的下單方法（模仿做市下單邏輯）"""
+        
+        """馬丁策略的下單方法（強化版）"""
         self.check_ws_connection()
         self.cancel_existing_orders()
-        try:
 
+        try:
             current_price = self.get_current_price()
             if not current_price:
-                logger.error("無法獲取當前價格，跳過下單")
+                logger.error("❌ 無法獲取當前價格，跳過下單")
                 return
 
             allocated_funds = self.allocate_funds()
-            logger.info(f"資金分配完成 | 各層金額: {allocated_funds}")
+            logger.info(f"✅ 資金分配完成，各層分配: {allocated_funds}")
 
-            orders = []
+            order_type = "market" if self.use_market_order else "limit"
+            side = "Buy" if self.direction == "long" else "Sell"
 
-            for level in range(self.max_layers):
-                price = round(current_price * (1 - self.price_step_down * level), self.quote_precision)
-                amount = allocated_funds[level] / price
+            for idx in range(self.max_layers):
+                price = round(current_price * (1 - self.price_step_down * idx), self.quote_precision)
+                amount = allocated_funds[idx] / price
                 amount = max(self.min_order_size, round_to_precision(amount, self.base_precision))
-                orders.append((price, amount))
 
-            for idx, (price, quantity) in enumerate(orders):
-                order_details = {
-                    "orderType": "Limit",
-                    "price": str(price),
-                    "quantity": str(quantity),
-                    "side": "Bid",
-                    "symbol": self.symbol,
-                    "timeInForce": "GTC",
-                    "postOnly": True,
-                }
+                logger.info(f"📤 提交第 {idx+1} 層: 價格={price}, 數量={amount}, 類型={order_type}")
 
-                if self.use_market_order:
-                    order_details["quoteQuantity"] = round(allocated_funds[idx], self.quote_precision)
-                else:
-                    order_details["quantity"] = round(quantity, self.base_precision)
-                    order_details["price"] = round(price, self.quote_precision)
+                retries = 3
+                for attempt in range(1, retries + 1):
+                    try:
+                        result = self.place_order(order_type, price, amount)
 
-                logger.info(f"📤 提交訂單 {idx+1}: {order_details}")
-                result = execute_order(self.api_key, self.secret_key, order_details)
+                        if isinstance(result, dict) and result.get("status") in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
+                            logger.info(f"✅ 第 {idx+1} 層下單成功: {result}")
+                            break
+                        else:
+                            logger.warning(f"⚠️ 第 {idx+1} 層下單失敗 (第{attempt}次): {result}")
+                    except Exception as e:
+                        logger.error(f"❌ 第 {idx+1} 層下單異常 (第{attempt}次): {e}")
 
-                if isinstance(result, dict) and result.get("status") in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
-    
-                    logger.info(f"✅ 層 {idx+1} 下單成功: {result}")
-                else:
-                    logger.warning(f"❌ 層 {idx+1} 下單失敗: {result}")
+                    time.sleep(2)  # 每次失敗後稍微等一下再試
+
         except Exception as e:
-            logger.error(f"馬丁下單異常: {e}")
+            logger.error(f"❌ 馬丁格爾批次下單異常: {e}")
         
     def check_exit_condition(self):
         if not self.filled_orders:
@@ -987,7 +981,8 @@ class MartingaleLongTrader:
                 order_response = None
 
             # 驗證下單是否成功
-            if order_response and order_response.get("status") in ["New", "PartiallyFilled", "Filled"]:
+            
+            if isinstance(order_response,dict) and order_response.get("status") in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
                 self.entry_price = float(order_response.get("price", price))
                 logger.info(f"✅ 首單下單成功，entry_price 設為 {self.entry_price}")
                 return
@@ -1011,23 +1006,24 @@ class MartingaleLongTrader:
 
     def place_order(self, order_type, price, quantity):
         order_details = {
+            "side": "Bid" ,
             "symbol": self.symbol,
-            "side": "Bid",
-            "orderType": order_type.capitalize(),  # "Limit" or "Market"
-            "timeInForce": "GTC",
         }
 
         if self.use_market_order or order_type.lower() == "market":
-            # quoteQuantity = 總金額（會成交多少 USDC）
-            quote_quantity = round(quantity * price, self.quote_precision)
-            order_details["quoteQuantity"] = quote_quantity
+            order_details["orderType"] = "Market"
+            order_details["quoteQuantity"] = round(quantity * price, self.quote_precision)
         else:
-            # Limit 單要設定 price + quantity + postOnly
-            order_details["quantity"] = round(quantity, self.base_precision)
+            order_details["orderType"] = "Limit"
             order_details["price"] = round(price, self.quote_precision)
+            order_details["quantity"] = round(quantity, self.base_precision)
+            order_details["timeInForce"] = "GTC"
             order_details["postOnly"] = True
+
         try:
             result = execute_order(self.api_key, self.secret_key, order_details)
+            
+            
             return result
         except Exception as e:
             logger.error(f"❌ 下單失敗: {e}")
@@ -1623,3 +1619,4 @@ class MartingaleLongTrader:
             if self.db:
                 self.db.close()
                 logger.info("數據庫連接已關閉")
+
