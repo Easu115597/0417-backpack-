@@ -20,6 +20,9 @@ from strategies.volatility import calculate_historical_volatility
 from logger import setup_logger
 from trading.order_manager import OrderManager
 
+import inspect
+print(f"execute_order: {execute_order}, type: {type(execute_order)}, from: {inspect.getsourcefile(execute_order)}")
+
 logger = setup_logger("martingale_long")
 
 class MartingaleLongTrader:
@@ -74,6 +77,7 @@ class MartingaleLongTrader:
         self.filled_orders = []
         self.current_position = 0
         self.poll_interval = 5
+        self.direction = 'long'
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -882,49 +886,177 @@ class MartingaleLongTrader:
             
         return orders
 
-    def place_martingale_orders(self):
+    def place_martingale_orders(self, base_size, entry_price, price_step_down, take_profit_pct, layers, quote_balance):
+        print(f"⛓️ 補單流程開始 entry_price={entry_price}")
+        layers -= 1  # 減掉首單
+        open_orders = []  # 紀錄自己掛出去的order_id，方便retry時刪單
+
+        for layer in range(1, layers + 1):
+            layer_price = round(entry_price - layer * price_step_down, 2)
+            layer_quote_amount = quote_balance / layers
+            layer_base_size = round(layer_quote_amount / layer_price, 5)
+
+            retry_count = 0
+            max_retries = 3
+
+            while retry_count <= max_retries:
+                try:
+                    print(f"📈 嘗試掛第 {layer} 層：價格={layer_price}，數量={layer_base_size}")
+                    order = self.place_order(
+                        side="buy",
+                        price=layer_price,
+                        size=layer_base_size,
+                        type="limit",
+                        reduce_only=False,
+                        post_only=True,
+                    )
+
+                    if order and order.get('status') == 'NEW':
+                        order_id = order.get('orderId')
+                        if order_id:
+                            open_orders.append(order_id)
+                        print(f"✅ 成功掛第 {layer} 層, order_id={order_id}")
+                        break  # 掛成功就繼續下一層
+                    else:
+                        print(f"⚠️ 掛單返回非 NEW 狀態，order={order}")
+                        retry_count += 1
+
+                except Exception as e:
+                    err_msg = str(e)
+                    print(f"❗ 掛單失敗，錯誤訊息: {err_msg}")
+
+                    if "INSUFFICIENT_FUNDS" in err_msg:
+                        print("❗ 資金不足，停止掛單")
+                        return
+                    elif "Order would immediately match and take" in err_msg:
+                        print("⏬ 掛單價格過高，下降 price_step_down 重試")
+                        layer_price = round(layer_price - price_step_down, 2)
+                    else:
+                        print("🔁 其他錯誤，retry一次")
+
+                    # 刪掉當層之前掛出去的order（如果有）
+                    if open_orders:
+                        last_order_id = open_orders.pop()
+                        self.cancel_order(last_order_id)
+                        print(f"🗑️ 刪除重掛自己的單，order_id={last_order_id}")
+
+                    retry_count += 1
+
+            if retry_count > max_retries:
+                print(f"🚫 第 {layer} 層掛單超過最大重試次數，放棄")
+
+        print("🏁 補單流程結束")
         
-        """馬丁策略的下單方法（強化版）"""
+    
+    def execute_first_entry(self): 
+        """執行首單，基於第一層分配資金，支援重試與市價備案"""
+        
         self.check_ws_connection()
-        self.cancel_existing_orders()
+
+        current_price = self.get_current_price()
+        if not current_price:
+            logger.error("❌ 無法獲取當前價格，跳過首單")
+            return
+
+        retries = 3
+        delay_seconds = 5
+
+        # 先取得第一層資金分配
+        allocated_funds = self.allocate_funds()
+        first_layer_fund = allocated_funds[0]
+        
+        logger.info(f"✅ 使用第一層分配資金: {first_layer_fund}")
+
+        for attempt in range(1, retries + 1):
+            logger.info(f"📤 嘗試第 {attempt} 次提交首單...")
+
+            self.cancel_existing_orders()
+
+            # 計算價格與訂單型態
+            if self.entry_type == "manual":
+                price = self.entry_price
+                order_type = "limit"
+            elif self.entry_type == "market":
+                price = current_price  # 為了 qty 計算
+                order_type = "market"
+            elif self.entry_type == "offset":
+                price = current_price * (1 - self.price_step_down)
+                order_type = "limit"
+            else:
+                raise ValueError(f"Unknown entry_type: {self.entry_type}")
+
+            # 依照分配資金算 quantity
+            qty = first_layer_fund / price
+            qty = max(self.min_order_size, round_to_precision(qty, self.base_precision))
+
+            try:
+                order_response = self.place_order(order_type, price, qty)
+            except Exception as e:
+                logger.warning(f"⚠️ 首單第 {attempt} 次下單異常: {e}")
+                order_response = None
+
+            # --- 驗證下單是否成功 ---
+            if isinstance(order_response, dict):
+                order_status = order_response.get("status", "").upper()
+                if order_status in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
+                    self.entry_price = float(order_response.get("price", price))
+                    logger.info(f"✅ 首單下單成功，entry_price 設為 {self.entry_price}")
+                    return
+                else:
+                    logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，Status: {order_status}, Response: {order_response}")
+            else:
+                logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，Response: {order_response}")
+
+            time.sleep(delay_seconds)
+
+        # --- 全部嘗試失敗，進入市價備案 ---
+        logger.warning("⚠️ 首單所有嘗試失敗，使用市價單進場")
+
+        fallback_qty = first_layer_fund / current_price
+        fallback_qty = max(self.min_order_size, round_to_precision(fallback_qty, self.base_precision))
 
         try:
-            current_price = self.get_current_price()
-            if not current_price:
-                logger.error("❌ 無法獲取當前價格，跳過下單")
-                return
-
-            allocated_funds = self.allocate_funds()
-            logger.info(f"✅ 資金分配完成，各層分配: {allocated_funds}")
-
-            order_type = "market" if self.use_market_order else "limit"
-            side = "Buy" if self.direction == "long" else "Sell"
-
-            for idx in range(self.max_layers):
-                price = round(current_price * (1 - self.price_step_down * idx), self.quote_precision)
-                amount = allocated_funds[idx] / price
-                amount = max(self.min_order_size, round_to_precision(amount, self.base_precision))
-
-                logger.info(f"📤 提交第 {idx+1} 層: 價格={price}, 數量={amount}, 類型={order_type}")
-
-                retries = 3
-                for attempt in range(1, retries + 1):
-                    try:
-                        result = self.place_order(order_type, price, amount)
-
-                        if isinstance(result, dict) and result.get("status") in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
-                            logger.info(f"✅ 第 {idx+1} 層下單成功: {result}")
-                            break
-                        else:
-                            logger.warning(f"⚠️ 第 {idx+1} 層下單失敗 (第{attempt}次): {result}")
-                    except Exception as e:
-                        logger.error(f"❌ 第 {idx+1} 層下單異常 (第{attempt}次): {e}")
-
-                    time.sleep(2)  # 每次失敗後稍微等一下再試
-
+            fallback_order = self.place_order("market", current_price, fallback_qty)
+            if fallback_order and fallback_order.get("status", "").upper() in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
+                self.entry_price = float(fallback_order.get("price", current_price))
+                logger.info(f"✅ 市價單備案成功，entry_price 設為 {self.entry_price}")
+            else:
+                logger.error(f"❌ 市價單備案仍失敗: {fallback_order}")
         except Exception as e:
-            logger.error(f"❌ 馬丁格爾批次下單異常: {e}")
+            logger.error(f"❌ 市價備案下單錯誤: {e}")
+
+
+    def place_order(self, order_type, price, quantity):
+        order_details = {
+            "side": "Bid" ,
+            "symbol": self.symbol,
+        }
+
+        if self.use_market_order or order_type.lower() == "market":
+            order_details["orderType"] = "Market"
+            order_details["quoteQuantity"] = round(quantity * price, self.quote_precision)
+        else:
+            order_details["orderType"] = "Limit"
+            order_details["price"] = round(price, self.quote_precision)
+            order_details["quantity"] = round(quantity, self.base_precision)
+            order_details["timeInForce"] = "GTC"
+            order_details["postOnly"] = True
+            
+
+        print("[DEBUG] order_details ready to sign:", order_details)
+
+        try:
+            result = execute_order(self.api_key, self.secret_key, order_details)
+            
+            
+            return result
+        except Exception as e:
+            logger.error(f"❌ 下單失敗: {e}")
+
+    
+            return None
         
+
     def check_exit_condition(self):
         if not self.filled_orders:
             logger.warning("⚠️ 尚無成交單，跳過出場判斷。")
@@ -949,85 +1081,23 @@ class MartingaleLongTrader:
 
         return False
     
-    def execute_first_entry(self):
-        current_price = self.get_current_price()
-        retries = 3
-        delay_seconds = 5
+    def calculate_avg_price(self):
+        """
+        計算目前倉位的加權平均進場價格
+        """
+        if not self.positions:
+            return 0
 
-        for attempt in range(1, retries + 1):
-            logger.info(f"📤 嘗試第 {attempt} 次提交首單...")
+        total_cost = 0
+        total_qty = 0
+        for position in self.positions:
+            total_cost += position['price'] * position['quantity']
+            total_qty += position['quantity']
+        
+        if total_qty == 0:
+            return 0
 
-            self.cancel_existing_orders()
-
-            # 計算價格與訂單型態
-            if self.entry_type == "manual":
-                price = self.entry_price
-                order_type = "limit"
-            elif self.entry_type == "market":
-                price = current_price  # 為了 qty 計算
-                order_type = "market"
-            elif self.entry_type == "offset":
-                price = current_price * (1 - self.price_step_down)
-                order_type = "limit"
-            else:
-                raise ValueError(f"Unknown entry_type: {self.entry_type}")
-
-            qty = self.calculate_quantity(price)
-
-            try:
-                order_response = self.place_order(order_type, price, qty)
-            except Exception as e:
-                logger.warning(f"⚠️ 首單下單錯誤: {e}")
-                order_response = None
-
-            # 驗證下單是否成功
-            
-            if isinstance(order_response,dict) and order_response.get("status") in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
-                self.entry_price = float(order_response.get("price", price))
-                logger.info(f"✅ 首單下單成功，entry_price 設為 {self.entry_price}")
-                return
-
-            logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，{delay_seconds} 秒後重試...")
-            time.sleep(delay_seconds)
-
-        # 所有 retry 失敗 → 市價備案
-        logger.warning("⚠️ 首單所有嘗試失敗，使用市價單進場")
-        fallback_qty = self.calculate_quantity(current_price)
-        try:
-            fallback_order = self.place_order("market", current_price, fallback_qty)
-            if fallback_order and fallback_order.get("status") == "Filled":
-                self.entry_price = float(fallback_order.get("price", current_price))
-                logger.info(f"✅ 市價單備案成功，entry_price 設為 {self.entry_price}")
-            else:
-                logger.error(f"❌ 市價單備案仍失敗: {fallback_order}")
-        except Exception as e:
-            logger.error(f"❌ 市價備案下單錯誤: {e}")
-
-
-    def place_order(self, order_type, price, quantity):
-        order_details = {
-            "side": "Bid" ,
-            "symbol": self.symbol,
-        }
-
-        if self.use_market_order or order_type.lower() == "market":
-            order_details["orderType"] = "Market"
-            order_details["quoteQuantity"] = round(quantity * price, self.quote_precision)
-        else:
-            order_details["orderType"] = "Limit"
-            order_details["price"] = round(price, self.quote_precision)
-            order_details["quantity"] = round(quantity, self.base_precision)
-            order_details["timeInForce"] = "GTC"
-            order_details["postOnly"] = True
-
-        try:
-            result = execute_order(self.api_key, self.secret_key, order_details)
-            
-            
-            return result
-        except Exception as e:
-            logger.error(f"❌ 下單失敗: {e}")
-            return None
+        return total_cost / total_qty
 
     
 
