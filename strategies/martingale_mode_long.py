@@ -34,6 +34,9 @@ class MartingaleLongTrader:
         entry_type,
         base_asset,
         quote_asset,
+        
+        
+        runtime=None,
         entry_price=None,
         db_instance=None,
         total_capital_usdt=100,
@@ -45,7 +48,7 @@ class MartingaleLongTrader:
         martingale_multiplier=1.3,
         use_market_order=True,
         target_price=None,
-        runtime=None,        
+              
         
         
         
@@ -69,15 +72,18 @@ class MartingaleLongTrader:
         base_quote = self.symbol.upper().split("_")
         self.base_asset = base_quote[0]
         self.quote_asset = base_quote[1]
-        self.runtime = runtime if runtime is not None else -1
+        self.runtime = runtime if runtime is not None else -1  # 如果 runtime 沒有傳進來，預設為 -1
         self.start_time = time.time()
         self.entry_price = None
         self.entry_type = entry_type
         self.open_orders = []
+        self.entry_orders = []
         self.filled_orders = []
         self.current_position = 0
         self.poll_interval = 5
         self.direction = 'long'
+        
+        
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -857,204 +863,111 @@ class MartingaleLongTrader:
             logger.info(f"已經訂閲了訂單更新: {stream}")
             return True
     
-    def generate_martingale_orders(self):
-        """生成马丁策略订单"""
-        orders = []
-        current_price = self.get_current_price()
-        if not current_price:
-            return []
 
-        # 动态计算加仓价格
-        for layer in range(self.current_layer + 1):
-            # 价格步长随层数增加
-            price_step = self.base_spread_percentage * (1 + layer*0.2)
-            
-            # 买单价差递增
-            buy_price = current_price * (1 - price_step/100)
-            buy_price = round_to_tick_size(buy_price, self.tick_size)
-            
-            # 卖单价差递增
-            sell_price = current_price * (1 + price_step/100) 
-            sell_price = round_to_tick_size(sell_price, self.tick_size)
-            
-            # 订单量指数增长
-            buy_size = self.base_order_size * (self.martingale_multiplier ** layer)
-            sell_size = buy_size  # 对称下单
-            
-            orders.append(('Bid', buy_price, buy_size))
-            orders.append(('Ask', sell_price, sell_size))
-            
+    def generate_martingale_orders(self, entry_price):
+        # 先算每層要用多少資金 (馬丁倍數分配)
+        allocations = []
+        remaining_capital = self.total_capital_usdt
+        current_alloc = remaining_capital / sum([self.martingale_multiplier ** i for i in range(self.max_layers)])
+
+        for i in range(self.max_layers):
+            allocations.append(current_alloc * (self.martingale_multiplier ** i))
+        
+        print(f"[資金分配比例] 各層資金分配: {allocations}")
+
+        orders = []
+        for i in range(self.max_layers):
+            price = round(entry_price * (1 - self.price_step_down * i), 2)
+            quantity = round(allocations[i] / price, 5)
+            orders.append({
+                "price": price,
+                "quantity": quantity
+            })
         return orders
 
-    def place_martingale_orders(self, base_size, entry_price, price_step_down, take_profit_pct, layers, quote_balance):
-        print(f"⛓️ 補單流程開始 entry_price={entry_price}")
-        layers -= 1  # 減掉首單
-        open_orders = []  # 紀錄自己掛出去的order_id，方便retry時刪單
+    def place_martingale_orders(self, symbol, entry_price):
+        self.active_orders.clear()
+        self.entry_prices.clear()
+        self.position_sizes.clear()
 
-        for layer in range(1, layers + 1):
-            layer_price = round(entry_price - layer * price_step_down, 2)
-            layer_quote_amount = quote_balance / layers
-            layer_base_size = round(layer_quote_amount / layer_price, 5)
+        orders = self.generate_martingale_orders(entry_price)
+        for i, order in enumerate(orders):
+            order_id = self.place_order(
+                symbol=symbol,
+                side="buy",
+                price=order['price'],
+                size=order['quantity'],
+                type="limit",
+                post_only=True
+            )
+            if order_id:
+                print(f"✅ 第{i+1}層掛單成功: {order}")
+                self.active_orders.append(order_id)
+                self.entry_prices.append(order['price'])
+                self.position_sizes.append(order['quantity'])
 
-            retry_count = 0
-            max_retries = 3
+    def place_order(self, symbol, side, price, size, type="limit", post_only=True):
+        # 🔥這裡接上你的交易所下單方法（只是範例）
+        print(f"[下單] {side.upper()} {size} {symbol} @ {price}")
+        # 假設回傳 order_id
+        return f"order_{side}_{price}"
 
-            while retry_count <= max_retries:
-                try:
-                    print(f"📈 嘗試掛第 {layer} 層：價格={layer_price}，數量={layer_base_size}")
-                    order = self.place_order(
-                        side="buy",
-                        price=layer_price,
-                        size=layer_base_size,
-                        type="limit",
-                        reduce_only=False,
-                        post_only=True,
-                    )
+    def monitor_and_exit(self, symbol):
+        # 🔥這裡自己加上成交監控、出場止盈止損邏輯
+        avg_entry_price = sum([self.entry_prices[i] * self.position_sizes[i] for i in range(len(self.entry_prices))]) / sum(self.position_sizes)
+        print(f"⚡ 當前均價: {avg_entry_price}")
 
-                    if order and order.get('status') == 'NEW':
-                        order_id = order.get('orderId')
-                        if order_id:
-                            open_orders.append(order_id)
-                        print(f"✅ 成功掛第 {layer} 層, order_id={order_id}")
-                        break  # 掛成功就繼續下一層
-                    else:
-                        print(f"⚠️ 掛單返回非 NEW 狀態，order={order}")
-                        retry_count += 1
+        current_price = self.get_market_price(symbol)
+        print(f"⚡ 市價: {current_price}")
 
-                except Exception as e:
-                    err_msg = str(e)
-                    print(f"❗ 掛單失敗，錯誤訊息: {err_msg}")
+        # 計算盈虧
+        pnl_pct = (current_price - avg_entry_price) / avg_entry_price
+        print(f"📈 盈虧%: {pnl_pct:.4f}")
 
-                    if "INSUFFICIENT_FUNDS" in err_msg:
-                        print("❗ 資金不足，停止掛單")
-                        return
-                    elif "Order would immediately match and take" in err_msg:
-                        print("⏬ 掛單價格過高，下降 price_step_down 重試")
-                        layer_price = round(layer_price - price_step_down, 2)
-                    else:
-                        print("🔁 其他錯誤，retry一次")
+        if pnl_pct >= self.take_profit_pct:
+            print("🎯 達到止盈！市價平倉！")
+            self.close_position(symbol)
+            return True
+        elif pnl_pct <= self.stop_loss_pct:
+            print("💀 達到止損！市價平倉！")
+            self.close_position(symbol)
+            return True
 
-                    # 刪掉當層之前掛出去的order（如果有）
-                    if open_orders:
-                        last_order_id = open_orders.pop()
-                        self.cancel_order(last_order_id)
-                        print(f"🗑️ 刪除重掛自己的單，order_id={last_order_id}")
+        return False
 
-                    retry_count += 1
+    def get_market_price(self, symbol):
+        # 🔥這裡要接你的實際API行情
+        return 100.0  # 假設市價
 
-            if retry_count > max_retries:
-                print(f"🚫 第 {layer} 層掛單超過最大重試次數，放棄")
+    def close_position(self, symbol):
+        # 🔥這裡要接你的市價賣出方法
+        print(f"💨 市價賣出 {symbol}，平倉！")
+        self.active_orders.clear()
+        self.entry_prices.clear()
+        self.position_sizes.clear()
 
-        print("🏁 補單流程結束")
+    def cancel_all_orders(self):
+        """取消所有現有掛單"""
+        orders = self.client.get_open_orders(self.symbol)
+        for order in orders:
+            self.client.cancel_order(order['orderId'])
+        self.open_orders = []
+
+    def execute_first_entry(self):
+        # 確保設定 entry_price，否則會丟出錯誤
+        if self.entry_price is None:
+            raise ValueError("請先設定進場價格！")
         
-    
-    def execute_first_entry(self): 
-        """執行首單，基於第一層分配資金，支援重試與市價備案"""
-        
-        self.check_ws_connection()
-
-        current_price = self.get_current_price()
-        if not current_price:
-            logger.error("❌ 無法獲取當前價格，跳過首單")
-            return
-
-        retries = 3
-        delay_seconds = 5
-
-        # 先取得第一層資金分配
-        allocated_funds = self.allocate_funds()
-        first_layer_fund = allocated_funds[0]
-        
-        logger.info(f"✅ 使用第一層分配資金: {first_layer_fund}")
-
-        for attempt in range(1, retries + 1):
-            logger.info(f"📤 嘗試第 {attempt} 次提交首單...")
-
-            self.cancel_existing_orders()
-
-            # 計算價格與訂單型態
-            if self.entry_type == "manual":
-                price = self.entry_price
-                order_type = "limit"
-            elif self.entry_type == "market":
-                price = current_price  # 為了 qty 計算
-                order_type = "market"
-            elif self.entry_type == "offset":
-                price = current_price * (1 - self.price_step_down)
-                order_type = "limit"
-            else:
-                raise ValueError(f"Unknown entry_type: {self.entry_type}")
-
-            # 依照分配資金算 quantity
-            qty = first_layer_fund / price
-            qty = max(self.min_order_size, round_to_precision(qty, self.base_precision))
-
-            try:
-                order_response = self.place_order(order_type, price, qty)
-            except Exception as e:
-                logger.warning(f"⚠️ 首單第 {attempt} 次下單異常: {e}")
-                order_response = None
-
-            # --- 驗證下單是否成功 ---
-            if isinstance(order_response, dict):
-                order_status = order_response.get("status", "").upper()
-                if order_status in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
-                    self.entry_price = float(order_response.get("price", price))
-                    logger.info(f"✅ 首單下單成功，entry_price 設為 {self.entry_price}")
-                    return
-                else:
-                    logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，Status: {order_status}, Response: {order_response}")
-            else:
-                logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，Response: {order_response}")
-
-            time.sleep(delay_seconds)
-
-        # --- 全部嘗試失敗，進入市價備案 ---
-        logger.warning("⚠️ 首單所有嘗試失敗，使用市價單進場")
-
-        fallback_qty = first_layer_fund / current_price
-        fallback_qty = max(self.min_order_size, round_to_precision(fallback_qty, self.base_precision))
-
-        try:
-            fallback_order = self.place_order("market", current_price, fallback_qty)
-            if fallback_order and fallback_order.get("status", "").upper() in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
-                self.entry_price = float(fallback_order.get("price", current_price))
-                logger.info(f"✅ 市價單備案成功，entry_price 設為 {self.entry_price}")
-            else:
-                logger.error(f"❌ 市價單備案仍失敗: {fallback_order}")
-        except Exception as e:
-            logger.error(f"❌ 市價備案下單錯誤: {e}")
-
-
-    def place_order(self, order_type, price, quantity):
-        order_details = {
-            "side": "Bid" ,
-            "symbol": self.symbol,
-        }
-
-        if self.use_market_order or order_type.lower() == "market":
-            order_details["orderType"] = "Market"
-            order_details["quoteQuantity"] = round(quantity * price, self.quote_precision)
-        else:
-            order_details["orderType"] = "Limit"
-            order_details["price"] = round(price, self.quote_precision)
-            order_details["quantity"] = round(quantity, self.base_precision)
-            order_details["timeInForce"] = "GTC"
-            order_details["postOnly"] = True
+        if self.current_layer == 0:  # 確保只執行一次
+            logger.info(f"執行第一筆入場單，價格: {self.entry_price}")
             
-
-        print("[DEBUG] order_details ready to sign:", order_details)
-
-        try:
-            result = execute_order(self.api_key, self.secret_key, order_details)
+            # 假設這裡改用拆解後的 place_order 或其他處理邏輯
+            self.place_order(self.entry_price, self.base_quantity)
             
-            
-            return result
-        except Exception as e:
-            logger.error(f"❌ 下單失敗: {e}")
+            # 更新層數
+            self.current_layer += 1
+            logger.info(f"第一筆入場單已下單，當前層數: {self.current_layer}")
 
-    
-            return None
         
 
     def check_exit_condition(self):
@@ -1502,8 +1415,8 @@ class MartingaleLongTrader:
         iteration = 0
         last_report_time = start_time
         report_interval = 300  # 5分鐘打印一次報表
-        self.execute_first_entry()
         level = 1
+        self.execute_first_entry()  # 確保第一次入場
         while True:            
             price = self.get_current_price()
             print(f"Current market price: {price}")
@@ -1526,22 +1439,26 @@ class MartingaleLongTrader:
                     order_type="market" if self.use_market_order else "limit",
                     use_market=self.use_market_order
                 )
-                print("Exit order placed:", sell_order)
+                print("止損訂單已下單:", sell_order)
                 break
 
             # 模擬價格下跌並掛買單
             if self.entry_price is None:
-                logger.error("❌ 無有效的 entry_price，跳過價格計算")
-                return
-            next_price = self.entry_price * (1 - self.price_step_down * level)
-            if not self.entry_price:
-                self.entry_price = price 
-            qty = self.calculate_quantity(next_price, level)
-            order = self.place_martingale_orders()
-            print(f"Layer {level} order placed at {next_price}")
-            self.filled_orders.append({'price': next_price, 'quantity': qty})
+                raise ValueError("請先設定進場價格！")
 
+            # 這段確保只會在執行時一次性下單
+            if self.current_layer == 0:
+                self.execute_first_entry()
+                
+            next_price = self.entry_price * (1 - self.price_step_down * level)
+            qty = self.calculate_quantity(next_price, level)  # 假設這個方法用來計算每層數量
+            self.place_martingale_orders(next_price, qty)
+
+            # 更新層數並進入下一輪
             level += 1
+            logger.info(f"層數 {level} 訂單已掛單，價格: {next_price}")
+
+            # 每輪延遲
             time.sleep(self.poll_interval)
 
             
