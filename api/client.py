@@ -130,6 +130,9 @@ def execute_order(api_key, secret_key, order_details):
     endpoint = f"/api/{API_VERSION}/order"
     instruction = "orderExecute"
     
+    method = "POST"
+    
+    
     # 提取所有參數用於簽名
     params = {
         "symbol": order_details["symbol"],
@@ -143,7 +146,7 @@ def execute_order(api_key, secret_key, order_details):
         
     else:
         # 限價單，帶 price, quantity, timeInForce, postOnly
-        params["price"] = order_details("price","0")
+        params["price"] = order_details.get("price", "0")
         params["quantity"] = order_details["quantity"]
         params["timeInForce"] = order_details.get("timeInForce", "GTC")
         params["postOnly"] = str(order_details.get("postOnly", False)).lower()
@@ -157,8 +160,12 @@ def execute_order(api_key, secret_key, order_details):
 
     print(f"make_request 現在是：{make_request}")
     print(f"make_request 類型：{type(make_request)}")
+    
+    print(f"[DEBUG] order_details ready to sign: {params}")
+    print("[DEBUG] Payload:", order_details)
 
-    return make_request("POST", endpoint, api_key, secret_key, instruction, params, params)
+    # 直接呼叫 make_request，不再自己組 URL
+    return make_request(method, endpoint, api_key, secret_key, instruction, params, order_details)
 
 def get_open_orders(api_key, secret_key, symbol=None):
     """獲取未成交訂單"""
