@@ -37,7 +37,7 @@ class MartingaleLongTrader:
         entry_price=None,
         db_instance=None,
         total_capital_usdt=100,
-        price_step_down=0.008,
+        price_step_down=0.05,
         take_profit_pct=0.012,
         stop_loss_pct=-0.33,
         current_layer=0,
@@ -886,52 +886,57 @@ class MartingaleLongTrader:
             
         return orders
 
-    def place_martingale_orders(self, base_size, entry_price, price_step_down, layers):
+    def place_martingale_orders(self, entry_price, price_step_down, layers):
         print(f"⛓️ 一次掛好 {layers - 1} 層補單，entry_price={entry_price}")
 
-        for layer in range(1, layers):
-            layer_price = round(entry_price - layer * price_step_down, 2)
-            layer_base_size = round(base_size, 5)  # 每一層單量一樣
-            
+        for i in range(1, layers):
             try:
-                print(f"📈 掛第 {layer} 層：價格={layer_price}，數量={layer_base_size}")
-                order = self.place_order(
-                    side="buy",
-                    price=layer_price,
-                    size=layer_base_size,
-                    type="limit",
-                    reduce_only=False,
-                    post_only=True,
-                )
+                next_price = entry_price * (1 - price_step_down * i)
+                next_price = max(next_price, 0.01)  # 保底，防止負數
+                
+                # 計算這層要下多少 quantity
+                layer_fund = self.fund_allocation[i]  # 每層分配資金
+                qty = layer_fund / next_price
+                qty = max(self.min_order_size, round_to_precision(qty, self.base_precision))
+
+                logger.info(f"📈 掛第 {i} 層：價格={next_price}，數量={qty}")
+                
+                order_type = "Limit"  # 或你自己定義
+                order = self.place_order(order_type, next_price, qty)
 
                 if order and order.get('status') == 'NEW':
-                    print(f"✅ 成功掛第 {layer} 層，order_id={order.get('orderId')}")
+                    print(f"✅ 成功掛第 {i} 層，order_id={order.get('orderId')}")
                 else:
-                    print(f"⚠️ 掛第 {layer} 層失敗，order={order}")
+                    print(f"⚠️ 掛第 {i} 層失敗，order={order}")
 
             except Exception as e:
-                print(f"❗ 掛第 {layer} 層失敗，錯誤訊息: {str(e)}")
+                print(f"❗ 掛第 {i} 層失敗，錯誤訊息: {str(e)}")
 
-        print("🏁 補單流程結束")
+    print("🏁 補單流程結束")
     
-    def execute_first_entry(self): 
-        """執行首單，基於第一層分配資金，支援重試與市價備案"""
-        
+    def execute_first_entry(self):
+        """執行首單並直接一次掛好後續馬丁單"""
+
+        logger.info("🚀 開始執行 execute_first_entry()")
+
         self.check_ws_connection()
 
         current_price = self.get_current_price()
         if not current_price:
             logger.error("❌ 無法獲取當前價格，跳過首單")
+            logger.debug("🔍 當前 current_price 取得結果為 None")
             return
 
         retries = 3
         delay_seconds = 5
 
-        # 先取得第一層資金分配
+        # 取得第一層資金分配
         allocated_funds = self.allocate_funds()
+        self.fund_allocation = allocated_funds
         first_layer_fund = allocated_funds[0]
-        
+
         logger.info(f"✅ 使用第一層分配資金: {first_layer_fund}")
+        logger.debug(f"🔍 分配資金列表: {allocated_funds}")
 
         for attempt in range(1, retries + 1):
             logger.info(f"📤 嘗試第 {attempt} 次提交首單...")
@@ -942,57 +947,94 @@ class MartingaleLongTrader:
             if self.entry_type == "manual":
                 price = self.entry_price
                 order_type = "limit"
+                logger.debug(f"📝 entry_type=manual，使用手動價格 {price}")
             elif self.entry_type == "market":
-                price = current_price  # 為了 qty 計算
+                price = current_price
                 order_type = "market"
+                logger.debug(f"📝 entry_type=market，使用市價 current_price={current_price}")
             elif self.entry_type == "offset":
                 price = current_price * (1 - self.price_step_down)
                 order_type = "limit"
+                logger.debug(f"📝 entry_type=offset，使用偏移價格 {price} (current_price={current_price}, step_down={self.price_step_down})")
             else:
+                logger.error(f"❌ 未知的 entry_type: {self.entry_type}")
                 raise ValueError(f"Unknown entry_type: {self.entry_type}")
 
-            # 依照分配資金算 quantity
             qty = first_layer_fund / price
             qty = max(self.min_order_size, round_to_precision(qty, self.base_precision))
 
+            logger.debug(f"🔢 計算下單數量 qty={qty} (first_layer_fund={first_layer_fund}, price={price})")
+
             try:
                 order_response = self.place_order(order_type, price, qty)
+                logger.debug(f"📩 下單回應: {order_response}")
             except Exception as e:
                 logger.warning(f"⚠️ 首單第 {attempt} 次下單異常: {e}")
                 order_response = None
 
-            # --- 驗證下單是否成功 ---
             if isinstance(order_response, dict):
                 order_status = order_response.get("status", "").upper()
+                logger.debug(f"🔍 取得回應 order_status={order_status}")
+
                 if order_status in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
                     self.entry_price = float(order_response.get("price", price))
                     logger.info(f"✅ 首單下單成功，entry_price 設為 {self.entry_price}")
+
+                    # --- 🛠️ 首單成功後，直接掛後面幾層馬丁單 ---
+                    qty = max(self.min_order_size, round_to_precision(qty, self.base_precision))
+                    layers = self.max_layers
+                    price_step_down_value = self.price_step_down / 100  # 每層下降比例（不是價格）
+
+                    logger.debug(f"🛠️ 掛單參數 qty=qty={qty}, layers={layers}, price_step_down_value={price_step_down_value}")
+
+                    self.place_martingale_orders(
+                        entry_price=self.entry_price,
+                        price_step_down=price_step_down_value,
+                        layers=layers
+                    )
                     return
                 else:
                     logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，Status: {order_status}, Response: {order_response}")
             else:
-                logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，Response: {order_response}")
+                logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，Response 非 dict 格式: {order_response}")
 
             time.sleep(delay_seconds)
 
-        # --- 全部嘗試失敗，進入市價備案 ---
+        # --- 如果全部失敗，走市價備案 ---
         logger.warning("⚠️ 首單所有嘗試失敗，使用市價單進場")
 
         fallback_qty = first_layer_fund / current_price
         fallback_qty = max(self.min_order_size, round_to_precision(fallback_qty, self.base_precision))
 
+        logger.debug(f"🆘 市價備案下單 fallback_qty={fallback_qty}, current_price={current_price}")
+
         try:
             fallback_order = self.place_order("market", current_price, fallback_qty)
+            logger.debug(f"📩 市價備案下單回應: {fallback_order}")
+
             if fallback_order and fallback_order.get("status", "").upper() in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
                 self.entry_price = float(fallback_order.get("price", current_price))
                 logger.info(f"✅ 市價單備案成功，entry_price 設為 {self.entry_price}")
+
+                base_size = fallback_qty
+                layers = self.max_layers
+                price_step_down_value = self.entry_price * self.price_step_down
+
+                logger.debug(f"🛠️ 市價備案後掛單參數 base_size={base_size}, layers={layers}, price_step_down_value={price_step_down_value}")
+
+                self.place_martingale_orders(
+                    base_size=base_size,
+                    entry_price=self.entry_price,
+                    price_step_down=price_step_down_value,
+                    layers=layers
+                )
             else:
                 logger.error(f"❌ 市價單備案仍失敗: {fallback_order}")
         except Exception as e:
             logger.error(f"❌ 市價備案下單錯誤: {e}")
 
 
-    def place_order(self, order_type, price, quantity):
+    def place_order(self, order_type, price, quantity,side="Bid", reduce_only=False, post_only=True):
         order_details = {
             "side": "Bid" ,
             "symbol": self.symbol,
@@ -1451,10 +1493,10 @@ class MartingaleLongTrader:
     
     def run(self, duration_seconds=-1, interval_seconds=60):
         """執行馬丁策略"""
+
         logger.info(f"開始運行馬丁策略: {self.symbol}")
-        logger.info(f"運行時間: {self.runtime if self.runtime else '不限'} 秒, 間隔: 60 秒")
-        
-        # 重置本次執行的統計數據
+        logger.info(f"運行時間: {duration_seconds if duration_seconds > 0 else '不限'} 秒, 間隔: {interval_seconds} 秒")
+
         self.session_start_time = datetime.now()
         self.session_buy_trades = []
         self.session_sell_trades = []
@@ -1463,24 +1505,42 @@ class MartingaleLongTrader:
         self.session_maker_sell_volume = 0.0
         self.session_taker_buy_volume = 0.0
         self.session_taker_sell_volume = 0.0
-        
+
         start_time = time.time()
         iteration = 0
         last_report_time = start_time
-        report_interval = 300  # 5分鐘打印一次報表
-        self.execute_first_entry()
+        report_interval = 300  # 每5分鐘打印一次報表
+
         level = 1
-        while True:            
+        max_layers = self.max_layers if hasattr(self, 'max_layers') else 10  # 預設最多10層
+        self.filled_orders = []
+
+        # 先下第一層入場單
+        self.execute_first_entry()
+
+        while duration_seconds == -1 or (time.time() - start_time) < duration_seconds:
+
+            now = time.time()
+            iteration += 1
+            logger.info(f"\n=== 第 {iteration} 次循環 ===")
+            logger.info(f"時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            # 檢查 WebSocket 連接狀態
+            if not self.check_ws_connection():
+                self.reconnect_ws()
+                self._ensure_data_streams()
+
+            # 取得當前市場價格
             price = self.get_current_price()
-            print(f"Current market price: {price}")
+            logger.info(f"當前市場價格: {price}")
 
+            # 如果尚無任何成交，跳過
+            if not self.filled_orders:
+                logger.warning("⚠️ 尚無成交單，跳過加碼和出場判斷")
+                time.sleep(interval_seconds)
+                continue
 
-            # 條件 1：時間限制（runtime > 0）
-            if self.runtime > 0 and time.time() - start_time >= self.runtime:
-                logger.info("🛑 已達指定運行時間，結束策略")
-                break
-
-            # 條件 2：止盈止損
+            # 檢查是否達到止盈或止損條件
             if self.check_exit_condition():
                 total_qty = sum(order['quantity'] for order in self.filled_orders)
                 target_price = price
@@ -1492,167 +1552,41 @@ class MartingaleLongTrader:
                     order_type="market" if self.use_market_order else "limit",
                     use_market=self.use_market_order
                 )
-                print("Exit order placed:", sell_order)
+                logger.info(f"Exit order placed: {sell_order}")
                 break
 
-            # 模擬價格下跌並掛買單
-            if self.entry_price is None:
-                logger.error("❌ 無有效的 entry_price，跳過價格計算")
-                return
-            next_price = self.entry_price * (1 - self.price_step_down * level)
-            if not self.entry_price:
-                self.entry_price = price 
-            qty = self.calculate_quantity(next_price, level)
-            order = self.place_martingale_orders()
-            print(f"Layer {level} order placed at {next_price}")
-            self.filled_orders.append({'price': next_price, 'quantity': qty})
+            # 檢查是否有新成交
+            self.check_order_fills()
 
-            level += 1
-            time.sleep(self.poll_interval)
+            # 如果最新持倉量增加了，且層數還沒到上限，則加碼下一層
+            if len(self.filled_orders) >= level and level < max_layers:
+                level += 1
+                next_price = self.entry_price * (1 - self.price_step_down * level)
+                qty = self.calculate_quantity(next_price, level)
 
-            
-        try:
-            connection_status = self.check_ws_connection()              
-                # 檢查並確保所有數據流訂閲
-            if connection_status:
-                # 初始化訂單簿和數據流    
-                if "bookTicker" not in self.ws.subscriptions:
-                    self.ws.subscribe_bookTicker()
-                if f"account.orderUpdate.{self.symbol}" not in self.ws.subscriptions:
-                    self.subscribe_order_updates()
-            
-            while time.time() - start_time < duration_seconds:
-                iteration += 1
-                current_time = time.time()
-                logger.info(f"\n=== 第 {iteration} 次迭代 ===")
-                logger.info(f"時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                
-                # 檢查連接並在必要時重連
-               
-                
-                # 如果連接成功，檢查並確保所有流訂閲
-                if connection_status:
-                    # 重新訂閲必要的數據流
-                    self._ensure_data_streams()
-                
-                # 檢查訂單成交情況
-                self.check_order_fills()
-                
-                               
-                # 下限價單
-                self.place_martingale_orders()
-                
+                order = self.api.place_martingale_orders(
+                    symbol=self.symbol,
+                    side="buy",
+                    price=next_price,
+                    quantity=qty,
+                    order_type="limit",
+                    use_market=False  # 加碼單通常用限價
+                )
+
+                if order:
+                    logger.info(f"Layer {level} 掛單成功，價格: {next_price}，數量: {qty}")
+                else:
+                    logger.error(f"Layer {level} 掛單失敗")
+
+            # 每隔一段時間打印一次報表
+            if now - last_report_time > report_interval:
+                self.report_session_statistics()
+                last_report_time = now
+
+            time.sleep(interval_seconds)
+
+        logger.info("✅ 運行結束")
                 # 估算利潤
-                self.estimate_profit()
+        self.estimate_profit()
                 
-                # 定期打印交易統計報表
-                if current_time - last_report_time >= report_interval:
-                    self.print_trading_stats()
-                    last_report_time = current_time
-                
-                # 計算總的PnL和本次執行的PnL
-                realized_pnl, unrealized_pnl, total_fees, net_pnl, session_realized_pnl, session_fees, session_net_pnl = self.calculate_pnl()
-                
-                logger.info(f"\n統計信息:")
-                logger.info(f"總交易次數: {self.trades_executed}")
-                logger.info(f"總下單次數: {self.orders_placed}")
-                logger.info(f"總取消訂單次數: {self.orders_cancelled}")
-                logger.info(f"買入總量: {self.total_bought} {self.base_asset}")
-                logger.info(f"賣出總量: {self.total_sold} {self.base_asset}")
-                logger.info(f"Maker買入: {self.maker_buy_volume} {self.base_asset}, Maker賣出: {self.maker_sell_volume} {self.base_asset}")
-                logger.info(f"Taker買入: {self.taker_buy_volume} {self.base_asset}, Taker賣出: {self.taker_sell_volume} {self.base_asset}")
-                logger.info(f"總手續費: {total_fees:.8f} {self.quote_asset}")
-                logger.info(f"已實現利潤: {realized_pnl:.8f} {self.quote_asset}")
-                logger.info(f"凈利潤: {net_pnl:.8f} {self.quote_asset}")
-                logger.info(f"未實現利潤: {unrealized_pnl:.8f} {self.quote_asset}")
-                logger.info(f"WebSocket連接狀態: {'已連接' if self.ws and self.ws.is_connected() else '未連接'}")
-                
-                # 打印本次執行的統計數據
-                logger.info(f"\n---本次執行統計---")
-                session_buy_volume = sum(qty for _, qty in self.session_buy_trades)
-                session_sell_volume = sum(qty for _, qty in self.session_sell_trades)
-                logger.info(f"買入量: {session_buy_volume} {self.base_asset}, 賣出量: {session_sell_volume} {self.base_asset}")
-                logger.info(f"Maker買入: {self.session_maker_buy_volume} {self.base_asset}, Maker賣出: {self.session_maker_sell_volume} {self.base_asset}")
-                logger.info(f"Taker買入: {self.session_taker_buy_volume} {self.base_asset}, Taker賣出: {self.session_taker_sell_volume} {self.base_asset}")
-                logger.info(f"本次執行已實現利潤: {session_realized_pnl:.8f} {self.quote_asset}")
-                logger.info(f"本次執行手續費: {session_fees:.8f} {self.quote_asset}")
-                logger.info(f"本次執行凈利潤: {session_net_pnl:.8f} {self.quote_asset}")
-                
-                wait_time = interval_seconds
-                logger.info(f"等待 {wait_time} 秒後進行下一次迭代...")
-                time.sleep(wait_time)
-                
-            # 結束運行時打印最終報表
-            logger.info("\n=== 馬丁策略運行結束 ===")
-            self.print_trading_stats()
-            
-            # 打印本次執行的最終統計摘要
-            logger.info("\n=== 本次執行統計摘要 ===")
-            session_buy_volume = sum(qty for _, qty in self.session_buy_trades)
-            session_sell_volume = sum(qty for _, qty in self.session_sell_trades)
-            session_total_volume = session_buy_volume + session_sell_volume
-            session_profit = self._calculate_session_profit()
-            
-            # 計算執行時間
-            td = datetime.now() - self.session_start_time
-            total_seconds = int(td.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-            run_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            logger.info(f"執行時間: {run_time}")
-            
-            logger.info(f"總成交量: {session_total_volume} {self.base_asset}")
-            logger.info(f"買入量: {session_buy_volume} {self.base_asset}, 賣出量: {session_sell_volume} {self.base_asset}")
-            logger.info(f"Maker買入: {self.session_maker_buy_volume} {self.base_asset}, Maker賣出: {self.session_maker_sell_volume} {self.base_asset}")
-            logger.info(f"Taker買入: {self.session_taker_buy_volume} {self.base_asset}, Taker賣出: {self.session_taker_sell_volume} {self.base_asset}")
-            logger.info(f"已實現利潤: {session_profit:.8f} {self.quote_asset}")
-            logger.info(f"總手續費: {self.session_fees:.8f} {self.quote_asset}")
-            logger.info(f"凈利潤: {(session_profit - self.session_fees):.8f} {self.quote_asset}")
-            
-            if session_total_volume > 0:
-                logger.info(f"每單位成交量利潤: {((session_profit - self.session_fees) / session_total_volume):.8f} {self.quote_asset}/{self.base_asset}")
         
-        except KeyboardInterrupt:
-            logger.info("\n用户中斷，停止馬丁策略")
-            
-            # 中斷時也打印本次執行的統計數據
-            logger.info("\n=== 本次執行統計摘要(中斷) ===")
-            session_buy_volume = sum(qty for _, qty in self.session_buy_trades)
-            session_sell_volume = sum(qty for _, qty in self.session_sell_trades)
-            session_total_volume = session_buy_volume + session_sell_volume
-            session_profit = self._calculate_session_profit()
-            
-            # 計算執行時間
-            td = datetime.now() - self.session_start_time
-            total_seconds = int(td.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            seconds = total_seconds % 60
-            run_time = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            logger.info(f"執行時間: {run_time}")
-            
-            logger.info(f"總成交量: {session_total_volume} {self.base_asset}")
-            logger.info(f"買入量: {session_buy_volume} {self.base_asset}, 賣出量: {session_sell_volume} {self.base_asset}")
-            logger.info(f"Maker買入: {self.session_maker_buy_volume} {self.base_asset}, Maker賣出: {self.session_maker_sell_volume} {self.base_asset}")
-            logger.info(f"Taker買入: {self.session_taker_buy_volume} {self.base_asset}, Taker賣出: {self.session_taker_sell_volume} {self.base_asset}")
-            logger.info(f"已實現利潤: {session_profit:.8f} {self.quote_asset}")
-            logger.info(f"總手續費: {self.session_fees:.8f} {self.quote_asset}")
-            logger.info(f"凈利潤: {(session_profit - self.session_fees):.8f} {self.quote_asset}")
-            
-            if session_total_volume > 0:
-                logger.info(f"每單位成交量利潤: {((session_profit - self.session_fees) / session_total_volume):.8f} {self.quote_asset}/{self.base_asset}")
-        
-        finally:
-            logger.info("取消所有未成交訂單...")
-            self.cancel_existing_orders()
-            
-            # 關閉 WebSocket
-            if self.ws:
-                self.ws.close()
-            
-            # 關閉數據庫連接
-            if self.db:
-                self.db.close()
-                logger.info("數據庫連接已關閉")
-
