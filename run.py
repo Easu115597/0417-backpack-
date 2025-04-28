@@ -51,16 +51,13 @@ def parse_arguments():
     # 馬丁策略專用參數組
 
     martingale_group = parser.add_argument_group('馬丁策略參數')
-    martingale_group.add_argument("--entry-type", type=str, default="offset", choices=["manual", "market", "offset"],
-                        help="首單下單方式: manual (指定價格), market (市價), offset (低於現價)")
-    martingale_group.add_argument("--entry-price", type=float, default=None,
-                        help="entry-type 為 manual 時必填：首筆入場價格")  
-
+    martingale_group.add_argument("--entry-type", type=str, default="offset", choices=["manual", "market", "offset"], help="首單下單方式: manual (指定價格), market (市價), offset (低於現價)")
+    martingale_group.add_argument("--entry-price", type=float, default=None, help="entry-type 為 manual 時必填：首筆入場價格")
 
     martingale_group.add_argument('--martingale', action='store_true', help='啟用馬丁策略')
     martingale_group.add_argument('--symbol',dest='symbol', type=str, default='SOL_USDC', help='馬丁策略交易對')
     martingale_group.add_argument('--total-capital', dest='total_capital', type=float, default=70, help='馬丁策略總投入 USDT')
-    martingale_group.add_argument('--price_step_down',dest='price_step_down', type=float, default=0.005, help='加倉下跌百分比')
+    martingale_group.add_argument('--price_step_down',dest='price_step_down', type=float, default=0.008, help='加倉下跌百分比')
     martingale_group.add_argument('--take_profit_pct', type=float, default=0.013, help='止盈百分比')
     martingale_group.add_argument('--stop_loss_pct', type=float, default=-0.33, help='停損百分比')
     martingale_group.add_argument('--max-layers', dest='max_layers', type=int, default=3, help='最大加倉層數')
@@ -134,7 +131,8 @@ def main():
                 martingale_multiplier=args.multiplier,
                 use_market_order=args.use_market_order,
                 target_price=args.target_price,
-                entry_type=args.entry_type
+                entry_type=args.entry_type,
+                entry_price=args.entry_price
                 
             
             )
