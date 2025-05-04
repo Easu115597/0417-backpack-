@@ -114,7 +114,7 @@ class MartingaleLongTrader:
         
         
         # 建立WebSocket連接
-        self.ws = BackpackWebSocket(symbol=self.symbol, api_key=self.api_key, secret_key=self.secret_key)
+        self.ws = BackpackWebSocket(api_key=self.api_key,secret_key=self.secret_key,symbol=self.symbol,strategy=self)
         self.ws.connect()
 
         # 執行緒池用於後台任務
@@ -531,7 +531,7 @@ class MartingaleLongTrader:
                 
                 order_type = "Limit"  # 或你自己定義
                 order = self.place_order(order_type, next_price, qty)
-                order_id = order["order_id"]
+                order_id = order.get["order_id"]
 
                 if order and order.get('status') == 'NEW':
                     print(f"✅ 成功掛第 {i} 層，order_id={order.get('orderId')}")
@@ -596,7 +596,7 @@ class MartingaleLongTrader:
 
             try:
                 order_response = self.place_order(order_type, price, qty)
-                order_id = order["order_id"]
+                order_id = order.get["order_id"]
 
                 monitor.add_order(
                     order_id=order_id,
@@ -654,14 +654,13 @@ class MartingaleLongTrader:
                 self.entry_price = float(fallback_order.get("price", current_price))
                 logger.info(f"✅ 市價單備案成功，entry_price 設為 {self.entry_price}")
 
-                base_size = fallback_qty
+                
                 layers = self.max_layers
                 price_step_down_value = self.price_step_down
 
-                logger.debug(f"🛠️ 市價備案後掛單參數 base_size={base_size}, layers={layers}, price_step_down_value={price_step_down_value}")
+                logger.debug(f"🛠️ 市價備案後掛單參數  layers={layers}, price_step_down_value={price_step_down_value}")
 
                 self.place_martingale_orders(
-                    base_size=base_size,
                     entry_price=self.entry_price,
                     price_step_down=price_step_down_value,
                     layers=layers
@@ -694,7 +693,7 @@ class MartingaleLongTrader:
         try:
             result = execute_order(self.api_key, self.secret_key, order_details)
             
-            
+            print("[DEBUG] Order placed result:", result)
             return result
         except Exception as e:
             logger.error(f"❌ 下單失敗: {e}")
@@ -704,28 +703,89 @@ class MartingaleLongTrader:
         
 
     def check_exit_condition(self):
-        if not self.filled_orders:
-            logger.warning("⚠️ 尚無成交單，跳過出場判斷。")
+        if not self.entry_price:
+            logger.warning("⚠️ 尚無成交單價，跳過出場判斷。")
             return False
 
         current_price = self.get_current_price()
-        avg_price = self.calculate_avg_price()
-
-        if avg_price == 0:
-            logger.warning("⚠️ 平均價格為 0，可能為錯誤狀態，跳過出場。")
+        avg_price = self._calculate_weighted_avg()
+        
+        # 防零除
+        if avg_price <= 0:
+            logger.error("❌ 無效的平均價格，跳過出場判斷")
             return False
-
-        pnl = (current_price - avg_price) / avg_price
-        print(f"🚦 當前價格: {current_price}, 平均成本: {avg_price}, PnL: {pnl:.4f}")
-
-        if pnl >= self.take_profit_pct:
-            print("🎯 達成止盈條件，結束交易")
+        
+        profit_pct = (current_price - avg_price) / avg_price
+        
+        # 止盈條件
+        if profit_pct >= self.take_profit_pct:
+            self.close_all_positions()
+            logger.info("🎯 達成止盈條件，結束交易")
             return True
-        elif pnl <= self.stop_loss_pct:
-            print("🛑 達成止損條件，結束交易")
+        
+        # 止損條件（注意stop_loss_pct是負值）
+        elif current_price <= avg_price * (1 + self.stop_loss_pct):
+            self.close_all_positions()
+            logger.info("🛑 達成止損條件，結束交易")
             return True
-
+        
         return False
+
+    def close_all_positions(self):
+        current_price = self.get_current_price()
+        # 市價單平倉
+        order_details = {
+            "symbol": self.symbol,
+            "side": "Ask",
+            "orderType": "Market",
+            "quantity": self.total_bought - self.total_sold
+        }
+        self.client.execute_order(order_details)
+        logger.info("🚀 觸發止盈/止損，市價平倉")
+
+    def on_order_update(self, data: dict):
+        """處理WebSocket訂單更新"""
+        if data.get('e') == 'orderFill':
+            order_id = data.get('i')
+            filled_qty = float(data.get('l', '0'))
+            price = float(data.get('L', '0'))
+            
+            # 更新持倉與均價
+            self.total_bought += filled_qty
+            self._update_average_price(price, filled_qty)
+            
+            logger.info(f"訂單成交: {order_id} | 數量: {filled_qty} @ {price}")
+
+    def _update_average_price(self, price: float, qty: float):
+        """動態更新持倉均價"""
+        total_cost = self.entry_price * self.total_bought + price * qty
+        self.total_bought += qty
+        self.entry_price = total_cost / self.total_bought if self.total_bought > 0 else 0
+   
+    
+    def check_order_status(self):
+        """每30秒檢查一次訂單狀態"""
+        while self.running:
+            for order in self.open_orders.copy():
+                response = self.client.get_order(order['id'])
+                if response['status'] == 'Filled':
+                    self._handle_filled_order(response)
+                elif response['status'] in ['Canceled', 'Expired']:
+                    self.open_orders.remove(order)
+            time.sleep(30)
+
+    def _calculate_weighted_avg(self):
+        total_cost = 0.0
+        total_qty = 0.0
+        for fill in self.filled_orders:
+            total_cost += float(fill['price']) * float(fill['quantity'])
+            total_qty += float(fill['quantity'])
+        return total_cost / total_qty if total_qty > 0 else 0.0
+
+    def on_order_filled(self, order_id):
+        order = self.db.get_order(order_id)
+        self.entry_price = self._calculate_average_price()
+        logger.info(f"📊 持倉均價更新: {self.entry_price}")
     
     def calculate_avg_price(self):
         """
