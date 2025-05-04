@@ -16,7 +16,7 @@ from logger import setup_logger
 logger = setup_logger("backpack_ws")
 
 class BackpackWebSocket:
-    def __init__(self, api_key, secret_key, symbol, on_message_callback=None, auto_reconnect=True, proxy=None):
+    def __init__(self, api_key, secret_key, symbol,strategy, on_message_callback=None, auto_reconnect=True, proxy=None):
         """
         初始化WebSocket客户端
         
@@ -32,6 +32,7 @@ class BackpackWebSocket:
         self.api_key = api_key
         self.secret_key = secret_key
         self.symbol = symbol.upper().replace('-', '_')
+        self.strategy = strategy
         self.ws = None
         self.on_message_callback = on_message_callback
         self.connected = False
@@ -43,6 +44,7 @@ class BackpackWebSocket:
         self.historical_prices = []  # 儲存歷史價格用於計算波動率
         self.max_price_history = 100  # 最多儲存的價格數量
         
+        self.subscribe(f"account.orderUpdate.{self.symbol}")
 
         # 重連相關參數
         self.auto_reconnect = auto_reconnect
@@ -91,6 +93,21 @@ class BackpackWebSocket:
         except Exception as e:                
             logger.info("📄 跳過初始化訂單簿（馬丁策略不使用）")
             return False
+        
+    def subscribe(self, stream: str):
+        """发送WebSocket订阅请求"""
+        if not self.connected:
+            logger.warning("WebSocket未连接，无法订阅")
+            return
+        
+        # 构建订阅消息
+        subscribe_msg = {
+            "method": "SUBSCRIBE",
+            "params": [stream],
+            "id": int(time.time()*1000)
+        }
+        self.ws.send(json.dumps(subscribe_msg))
+        logger.debug(f"已订阅频道: {stream}")
     
     def add_price_to_history(self, price):
         """添加價格到歷史記錄用於計算波動率"""
@@ -267,6 +284,8 @@ class BackpackWebSocket:
         """WebSocket打開時的處理"""
         logger.info("WebSocket連接已建立")
         self.connected = True
+        self.subscribe(f"account.orderUpdate.{self.symbol}")
+        self.subscribe(f"bookTicker.{self.symbol}")
         self.reconnect_attempts = 0
         self.last_heartbeat = time.time()
         
@@ -359,6 +378,11 @@ class BackpackWebSocket:
                 stream = data["stream"]
                 event_data = data["data"]
                 
+                # 新增訂單更新回調
+                if stream.startswith("account.orderUpdate."):
+                    if self.strategy:
+                        self.strategy.on_order_update(event_data)  # 觸發策略層處理
+                        
                 # 處理bookTicker
                 if stream.startswith("bookTicker."):
                     if 'b' in event_data and 'a' in event_data:
@@ -567,3 +591,17 @@ class BackpackWebSocket:
             'imbalance': imbalance,
             'mid_price': mid_price
         }
+    
+    def on_order_update(self, data):
+        """處理訂單成交事件"""
+        if data.get('e') == 'orderFill':
+            order_id = data['i']
+            filled_qty = float(data['l'])
+            price = float(data['L'])
+            
+            # 更新策略狀態
+            self.strategy.handle_order_fill(order_id, filled_qty, price)
+            
+            # 觸發後續掛單
+            if self.strategy.current_layer < self.strategy.max_layers:
+                self.strategy.place_martingale_orders(price)
