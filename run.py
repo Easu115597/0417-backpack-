@@ -9,7 +9,8 @@ import os
 import logging
 import asyncio
 
-from strategies.martingale_mode_long  import MartingaleLongTrader 
+from strategies.martingale_mode_long import MartingaleLongTrader 
+
 try:
     from logger import setup_logger
     from config import API_KEY, SECRET_KEY, WS_PROXY
@@ -17,7 +18,7 @@ except ImportError:
     API_KEY = os.getenv('API_KEY')
     SECRET_KEY = os.getenv('SECRET_KEY')
     WS_PROXY = os.getenv('PROXY_WEBSOCKET')
-    
+
     def setup_logger(name):
         import logging
         logger = logging.getLogger(name)
@@ -26,32 +27,25 @@ except ImportError:
         handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
         logger.addHandler(handler)
         return logger
+
 from dotenv import load_dotenv
-load_dotenv()# ✅ 這行讓你可以從 .env 讀入 API_KEY / SECRET_KEY
+load_dotenv()
 
-
-
-
-# 創建記錄器
 logger = setup_logger("main")
 logging.basicConfig(level=logging.DEBUG)
 
 def parse_arguments():
-    """解析命令行參數"""
     parser = argparse.ArgumentParser(description='Backpack Exchange 馬丁交易Bot', conflict_handler='resolve')
-    
-    # 主模式選擇參數組
+
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument('--panel', action='store_true', help='啟動圖形界面面板')
     mode_group.add_argument('--cli', action='store_true', help='啟動命令行界面')
     mode_group.add_argument('--martingale', action='store_true', help='啟動馬丁現貨多單策略')
-    
-    # API Key 和 WS Proxy
+
     parser.add_argument('--api-key', type=str, help='API Key')
     parser.add_argument('--secret-key', type=str, help='Secret Key')
     parser.add_argument('--ws-proxy', type=str, help='WebSocket Proxy')
 
-    # 馬丁策略參數
     martingale_group = parser.add_argument_group('馬丁策略參數')
     martingale_group.add_argument('--symbol', type=str, default='SOL_USDC', help='馬丁策略交易對')
     martingale_group.add_argument('--total-capital', type=float, default=70, help='總投入 USDT')
@@ -69,14 +63,14 @@ def parse_arguments():
 
     return parser.parse_args()
 
-def main():
-    """主函數"""
+
+async def main():
     args = parse_arguments()
-    
+
     api_key = args.api_key or API_KEY
     secret_key = args.secret_key or SECRET_KEY
     ws_proxy = args.ws_proxy or WS_PROXY
-    
+
     if not api_key or not secret_key:
         logger.error("缺少API密鑰，請提供")
         sys.exit(1)
@@ -116,7 +110,7 @@ def main():
                 entry_type=args.entry_type,
                 entry_price=args.entry_price
             )
-            trader.run()
+            await trader.run()
         except Exception as e:
             logger.error(f"馬丁策略執行錯誤: {e}")
             import traceback
@@ -124,5 +118,6 @@ def main():
     else:
         print("請指定模式：--panel 或 --cli 或 --martingale")
 
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
