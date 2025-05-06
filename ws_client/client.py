@@ -613,3 +613,10 @@ class BackpackWebSocket:
             # 觸發後續掛單
             if self.strategy.current_layer < self.strategy.max_layers:
                 self.strategy.place_martingale_orders(price)
+
+    def get_price_from_ws(symbol):
+        ws = BackpackWebSocket()
+        ws.connect()
+        price = ws.get_price(symbol)
+        ws.disconnect()
+        return price
