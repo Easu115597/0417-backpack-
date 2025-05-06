@@ -10,7 +10,7 @@ from trading.Ordermonitor import OrderMonitor
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional, Union, Any
 from concurrent.futures import ThreadPoolExecutor
-
+from decimal import Decimal
 from api.client import (
     get_balance, execute_order, get_open_orders, cancel_all_orders, 
     cancel_order, get_market_limits, get_klines, get_ticker, get_order_book
@@ -20,22 +20,27 @@ from database.db import Database
 from utils.helpers import round_to_precision, round_to_tick_size, calculate_volatility
 from strategies.volatility import calculate_historical_volatility
 from logger import setup_logger
-from trading.order_manager import OrderManager
+from trading.Ordermonitor import OrderMonitor
 
 import inspect
 print(f"execute_order: {execute_order}, type: {type(execute_order)}, from: {inspect.getsourcefile(execute_order)}")
 
 logger = setup_logger("martingale_long")
 
+
+
 class MartingaleLongTrader:
     def __init__(
         self,
+        
         api_key,
         secret_key,
         symbol,
         entry_type,
+        
         base_asset,
         quote_asset,
+        order_monitor=None,
         entry_price=None,
         db_instance=None,
         total_capital_usdt=100,
@@ -48,18 +53,19 @@ class MartingaleLongTrader:
         use_market_order=True,
         target_price=None,
         runtime=None,        
-        monitor=None
-        
-        
+        monitor=None,
+              
         ):
         self.api_key = api_key
         self.secret_key = secret_key
+       
         self.symbol = symbol 
+        
         self.total_capital = total_capital_usdt
         self.price_step_down = price_step_down
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
-        self.current_layer = current_layer
+        self.current_layer = 0
         self.max_layers = max_layers
         self.multiplier = martingale_multiplier
         self.use_market_order = use_market_order
@@ -81,8 +87,15 @@ class MartingaleLongTrader:
         self.poll_interval = 5
         self.direction = 'long'
         self.monitor = monitor  # 新增監控器
-
+        self.orders_cancelled = []
         self.fund_allocation = []
+        self.order_monitor = order_monitor
+        self.success_orders = []
+        self.active_orders = []
+        
+
+        
+    
 
         # 初始化數據庫
         self.db = db_instance if db_instance else Database()
@@ -514,166 +527,49 @@ class MartingaleLongTrader:
             
         return orders
 
-    def place_martingale_orders(self, entry_price, price_step_down, layers):
-        print(f"⛓️ 一次掛好 {layers - 1} 層補單，entry_price={entry_price}")
+    async def place_martingale_orders(self, entry_price, price_step_down, layers):
+        logger.info("🚀 Placing Martingale Ladder Orders")
 
-        for i in range(1, layers):
+        self.entry_price = entry_price
+        self.price_step_down = price_step_down
+        self.max_layers = layers
+
+        self.active_orders = []
+
+        for layer in range(layers):  # 從第0層開始，包含首單
             try:
-                next_price = entry_price * (1 - price_step_down * i)
-                next_price = max(next_price, 0.01)  # 保底，防止負數
-                
-                # 計算這層要下多少 quantity
-                layer_fund = self.fund_allocation[i]  # 每層分配資金
-                qty = layer_fund / next_price
-                qty = max(self.min_order_size, round_to_precision(qty, self.base_precision))
+                price = entry_price * (1 - price_step_down * layer)
+                price = round_to_tick_size(price, self.tick_size)
+                size = self.base_order_size * (self.martingale_multiplier ** layer)
 
-                logger.info(f"📈 掛第 {i} 層：價格={next_price}，數量={qty}")
-                
-                order_type = "Limit"  # 或你自己定義
-                order = self.place_order(order_type, next_price, qty)
-                order_id = order.get["order_id"]
-
-                if order and order.get('status') == 'NEW':
-                    print(f"✅ 成功掛第 {i} 層，order_id={order.get('orderId')}")
-                else:
-                    print(f"⚠️ 掛第 {i} 層失敗，order={order}")
-
-            except Exception as e:
-                print(f"❗ 掛第 {i} 層失敗，錯誤訊息: {str(e)}")
-
-    print("🏁 補單流程結束")
-    
-    def execute_first_entry(self):
-        """執行首單並直接一次掛好後續馬丁單"""
-
-        logger.info("🚀 開始執行 execute_first_entry()")
-
-        self.check_ws_connection()
-
-        current_price = self.get_current_price()
-        if not current_price:
-            logger.error("❌ 無法獲取當前價格，跳過首單")
-            logger.debug("🔍 當前 current_price 取得結果為 None")
-            return
-
-        retries = 3
-        delay_seconds = 5
-
-        # 取得第一層資金分配
-        allocated_funds = self.allocate_funds()
-        self.fund_allocation = allocated_funds
-        first_layer_fund = allocated_funds[0]
-
-        logger.info(f"✅ 使用第一層分配資金: {first_layer_fund}")
-        logger.debug(f"🔍 分配資金列表: {allocated_funds}")
-
-        for attempt in range(1, retries + 1):
-            logger.info(f"📤 嘗試第 {attempt} 次提交首單...")
-
-            self.cancel_existing_orders()
-
-            # 計算價格與訂單型態
-            if self.entry_type == "manual":
-                price = self.entry_price
-                order_type = "limit"
-                logger.debug(f"📝 entry_type=manual，使用手動價格 {price}")
-            elif self.entry_type == "market":
-                price = current_price
-                order_type = "market"
-                logger.debug(f"📝 entry_type=market，使用市價 current_price={current_price}")
-            elif self.entry_type == "offset":
-                price = current_price * (1 - self.price_step_down)
-                order_type = "limit"
-                logger.debug(f"📝 entry_type=offset，使用偏移價格 {price} (current_price={current_price}, step_down={self.price_step_down})")
-            else:
-                logger.error(f"❌ 未知的 entry_type: {self.entry_type}")
-                raise ValueError(f"Unknown entry_type: {self.entry_type}")
-
-            qty = first_layer_fund / price
-            qty = max(self.min_order_size, round_to_precision(qty, self.base_precision))
-
-            logger.debug(f"🔢 計算下單數量 qty={qty} (first_layer_fund={first_layer_fund}, price={price})")
-
-            try:
-                order_response = self.place_order(order_type, price, qty)
-                order_id = order.get["order_id"]
-
-                monitor.add_order(
-                    order_id=order_id,
-                    symbol=symbol,
-                    side="buy",
+                res = await self.place_order(
+                    order_type="Limit",
                     price=price,
-                    size=size
+                    quantity=size,
+                    side="Bid",
+                    reduce_only=False,
+                    post_only=True
                 )
-                logger.debug(f"📩 下單回應: {order_response}")
-            except Exception as e:
-                logger.warning(f"⚠️ 首單第 {attempt} 次下單異常: {e}")
-                order_response = None
 
-            if isinstance(order_response, dict):
-                order_status = order_response.get("status", "").upper()
-                logger.debug(f"🔍 取得回應 order_status={order_status}")
-
-                if order_status in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
-                    self.entry_price = float(order_response.get("price", price))
-                    logger.info(f"✅ 首單下單成功，entry_price 設為 {self.entry_price}")
-
-                    # --- 🛠️ 首單成功後，直接掛後面幾層馬丁單 ---
-                    qty = max(self.min_order_size, round_to_precision(qty, self.base_precision))
-                    layers = self.max_layers
-                    price_step_down_value = self.price_step_down  # 每層下降比例（不是價格）
-
-                    logger.debug(f"🛠️ 掛單參數 qty=qty={qty}, layers={layers}, price_step_down_value={price_step_down_value}")
-
-                    self.place_martingale_orders(
-                        entry_price=self.entry_price,
-                        price_step_down=price_step_down_value,
-                        layers=layers
-                    )
-                    return
+                if res and "order_id" in res:
+                    logger.info(f"✅ Placed Tier {layer + 1} Order: {res['order_id']}")
+                    self.active_orders.append({
+                        "order_id": res["order_id"],
+                        "price": price,
+                        "size": size,
+                        "tier": layer + 1
+                    })
                 else:
-                    logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，Status: {order_status}, Response: {order_response}")
-            else:
-                logger.warning(f"⚠️ 首單第 {attempt} 次下單失敗，Response 非 dict 格式: {order_response}")
-
-            time.sleep(delay_seconds)
-
-        # --- 如果全部失敗，走市價備案 ---
-        logger.warning("⚠️ 首單所有嘗試失敗，使用市價單進場")
-
-        fallback_qty = first_layer_fund / current_price
-        fallback_qty = max(self.min_order_size, round_to_precision(fallback_qty, self.base_precision))
-
-        logger.debug(f"🆘 市價備案下單 fallback_qty={fallback_qty}, current_price={current_price}")
-
-        try:
-            fallback_order = self.place_order("market", current_price, fallback_qty)
-            logger.debug(f"📩 市價備案下單回應: {fallback_order}")
-
-            if fallback_order and fallback_order.get("status", "").upper() in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
-                self.entry_price = float(fallback_order.get("price", current_price))
-                logger.info(f"✅ 市價單備案成功，entry_price 設為 {self.entry_price}")
-
-                
-                layers = self.max_layers
-                price_step_down_value = self.price_step_down
-
-                logger.debug(f"🛠️ 市價備案後掛單參數  layers={layers}, price_step_down_value={price_step_down_value}")
-
-                self.place_martingale_orders(
-                    entry_price=self.entry_price,
-                    price_step_down=price_step_down_value,
-                    layers=layers
-                )
-            else:
-                logger.error(f"❌ 市價單備案仍失敗: {fallback_order}")
-        except Exception as e:
-            logger.error(f"❌ 市價備案下單錯誤: {e}")
+                    logger.warning(f"⚠️ No order_id returned for Tier {layer + 1} order.")
+            except Exception as e:
+                logger.error(f"❌ Error placing Tier {layer + 1} order: {e}")
 
 
-    def place_order(self, order_type, price, quantity,side="Bid", reduce_only=False, post_only=True):
+    
+    
+    async def place_order(self, order_type, price, quantity, side="Bid", reduce_only=False, post_only=True):
         order_details = {
-            "side": "Bid" ,
+            "side": side,
             "symbol": self.symbol,
         }
 
@@ -685,20 +581,16 @@ class MartingaleLongTrader:
             order_details["price"] = round(price, self.quote_precision)
             order_details["quantity"] = round(quantity, self.base_precision)
             order_details["timeInForce"] = "GTC"
-            order_details["postOnly"] = True
-            
+            order_details["postOnly"] = post_only
 
-        print("[DEBUG] order_details ready to sign:", order_details)
+        logger.debug(f"[DEBUG] order_details ready to sign: {order_details}")
 
         try:
-            result = execute_order(self.api_key, self.secret_key, order_details)
-            
-            print("[DEBUG] Order placed result:", result)
+            result = await self.client.place_order(order_details)
+            logger.debug(f"[DEBUG] Order placed result: {result}")
             return result
         except Exception as e:
             logger.error(f"❌ 下單失敗: {e}")
-
-    
             return None
         
 
@@ -740,7 +632,7 @@ class MartingaleLongTrader:
             "orderType": "Market",
             "quantity": self.total_bought - self.total_sold
         }
-        self.client.execute_order(order_details)
+        execute_order(order_details)
         logger.info("🚀 觸發止盈/止損，市價平倉")
 
     def on_order_update(self, data: dict):
@@ -767,7 +659,7 @@ class MartingaleLongTrader:
         """每30秒檢查一次訂單狀態"""
         while self.running:
             for order in self.open_orders.copy():
-                response = self.client.get_order(order['id'])
+                response = get_order(order['id'])
                 if response['status'] == 'Filled':
                     self._handle_filled_order(response)
                 elif response['status'] in ['Canceled', 'Expired']:
@@ -787,23 +679,15 @@ class MartingaleLongTrader:
         self.entry_price = self._calculate_average_price()
         logger.info(f"📊 持倉均價更新: {self.entry_price}")
     
-    def calculate_avg_price(self):
-        """
-        計算目前倉位的加權平均進場價格
-        """
-        if not self.positions:
-            return 0
-
-        total_cost = 0
-        total_qty = 0
-        for position in self.positions:
-            total_cost += position['price'] * position['quantity']
-            total_qty += position['quantity']
+    def calculate_average_price(self):
+        """加權平均計算防呆"""
+        if not self.filled_orders:
+            return 0.0
         
-        if total_qty == 0:
-            return 0
-
-        return total_cost / total_qty
+        total_cost = sum(o['price']*o['quantity'] for o in self.filled_orders)
+        total_qty = sum(o['quantity'] for o in self.filled_orders)
+        
+        return total_cost / total_qty if total_qty != 0 else 0.0
     
     def handle_order_fill(order):
         symbol = order["symbol"]
@@ -884,7 +768,7 @@ class MartingaleLongTrader:
                     
                     # 提交取消訂單任務
                     for order in open_orders:
-                        order_id = order.get('id')
+                        order_id = order_response.get("order_id")
                         if not order_id:
                             continue
                         
@@ -940,7 +824,7 @@ class MartingaleLongTrader:
         current_order_ids = set()
         if open_orders:
             for order in open_orders:
-                order_id = order.get('id')
+                order_id = order_response.get("order_id")
                 if order_id:
                     current_order_ids.add(order_id)
         
@@ -962,7 +846,7 @@ class MartingaleLongTrader:
         # 檢查買單成交
         filled_buy_orders = []
         for order in self.active_buy_orders:
-            order_id = order.get('id')
+            order_id = order_response.get("order_id")
             if order_id and order_id not in current_order_ids:
                 price = float(order.get('price', 0))
                 quantity = float(order.get('quantity', 0))
@@ -972,7 +856,7 @@ class MartingaleLongTrader:
         # 檢查賣單成交
         filled_sell_orders = []
         for order in self.active_sell_orders:
-            order_id = order.get('id')
+            order_id = order_response.get("order_id")
             if order_id and order_id not in current_order_ids:
                 price = float(order.get('price', 0))
                 quantity = float(order.get('quantity', 0))
@@ -1003,7 +887,7 @@ class MartingaleLongTrader:
             logger.info("重新訂閲私有訂單更新流...")
             self.subscribe_order_updates()
     
-    def run(self, duration_seconds=-1, interval_seconds=60):
+    async def run(self, duration_seconds=-1, interval_seconds=60):
         """執行馬丁策略"""
 
         logger.info(f"開始運行馬丁策略: {self.symbol}")
@@ -1017,18 +901,31 @@ class MartingaleLongTrader:
         self.session_maker_sell_volume = 0.0
         self.session_taker_buy_volume = 0.0
         self.session_taker_sell_volume = 0.0
+        self.filled_orders = []
 
         start_time = time.time()
         iteration = 0
         last_report_time = start_time
         report_interval = 300  # 每5分鐘打印一次報表
 
-        level = 1
-        max_layers = self.max_layers if hasattr(self, 'max_layers') else 10  # 預設最多10層
-        self.filled_orders = []
+        
 
-        # 先下第一層入場單
-        self.execute_first_entry()
+        # 初始化 entry_price
+        if self.entry_type in ("offset", "market"):
+            ticker = await self.client.get_ticker(self.symbol)
+            self.entry_price = float(ticker["price"])
+        elif self.entry_type == "manual":
+            if self.entry_price is None:
+                raise ValueError("manual entry requires --entry-price")
+        else:
+            raise ValueError(f"Unsupported entry_type: {self.entry_type}")
+
+        # ✅ 一次掛好所有層數的馬丁單（包含首單）
+        await self.place_martingale_orders(
+            entry_price=self.entry_price,
+            price_step_down=self.price_step_down,
+            layers=self.max_layers
+        )
 
         while duration_seconds == -1 or (time.time() - start_time) < duration_seconds:
 
@@ -1049,20 +946,19 @@ class MartingaleLongTrader:
             # 如果尚無任何成交，跳過
             if not self.filled_orders:
                 logger.warning("⚠️ 尚無成交單，跳過加碼和出場判斷")
-                time.sleep(interval_seconds)
+                await asyncio.sleep(interval_seconds)
                 continue
 
             # 檢查是否達到止盈或止損條件
             if self.check_exit_condition():
                 total_qty = sum(order['quantity'] for order in self.filled_orders)
                 target_price = price
-                sell_order = self.api.place_martingale_orders(
-                    symbol=self.symbol,
-                    side="sell",
+                sell_order = self.api.place_order(
+                    order_type="market" if self.use_market_order else "limit",
                     price=target_price,
                     quantity=total_qty,
-                    order_type="market" if self.use_market_order else "limit",
-                    use_market=self.use_market_order
+                    side="Ask",  # 賣出
+                    reduce_only=True
                 )
                 logger.info(f"Exit order placed: {sell_order}")
                 break
@@ -1070,37 +966,110 @@ class MartingaleLongTrader:
             # 檢查是否有新成交
             self.check_order_fills()
 
-            # 如果最新持倉量增加了，且層數還沒到上限，則加碼下一層
-            if len(self.filled_orders) >= level and level < max_layers:
-                level += 1
-                next_price = self.entry_price * (1 - self.price_step_down * level)
-                qty = self.calculate_quantity(next_price, level)
-
-                order = self.api.place_martingale_orders(
-                    symbol=self.symbol,
-                    side="buy",
-                    price=next_price,
-                    quantity=qty,
-                    order_type="limit",
-                    use_market=False  # 加碼單通常用限價
-                )
-
-                if order:
-                    logger.info(f"Layer {level} 掛單成功，價格: {next_price}，數量: {qty}")
-                else:
-                    logger.error(f"Layer {level} 掛單失敗")
-
             # 每隔一段時間打印一次報表
             if now - last_report_time > report_interval:
                 self.report_session_statistics()
                 last_report_time = now
 
-            time.sleep(interval_seconds)
+            await asyncio.sleep(interval_seconds)
 
+            
         logger.info("✅ 運行結束")
                 # 估算利潤
         self.estimate_profit()
+
+    async def start(self):
+        logger.info("Starting Martingale Strategy")
+        await self.place_entry_orders()
                 
-        
+    async def place_entry_orders(self):
+        logger.info("Placing entry orders")
+        tasks = []
+        for i in range(3):
+            tier_price = self.entry_price - (i * self.price_step_down)
+            tier_qty = self.base_qty * (self.multiplier ** i)
+            logger.info(f"Tier {i+1}: price={tier_price}, qty={tier_qty}")
+            tasks.append(self.execute_limit_order(price=tier_price, qty=tier_qty))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, dict) and result.get("status") == "filled":
+                self.success_orders.append(result)
+
+        if not self.success_orders and self.use_market_order:
+            logger.warning("No limit orders filled. Falling back to market order.")
+            market_result = await self.execute_market_order()
+            if market_result:
+                self.success_orders.append(market_result)
+
+        if self.success_orders:
+            logger.info(f"Entry filled: {self.success_orders}")
+            await self.place_next_orders()
+        else:
+            logger.error("No orders were filled. Strategy stops here.")
+
+    async def execute_limit_order(self, price, qty):
+        try:
+            logger.info(f"Placing limit order at {price} for qty {qty}")
+            order = await place_order(
+                symbol=self.symbol,
+                side="buy",
+                type="limit",
+                price=price,
+                size=qty,
+                post_only=True,
+            )
+            logger.info(f"Limit order placed: {order['order_id']}")
+            status = await self.order_monitor.wait_for_status(order['order_id'])
+            logger.info(f"Order status: {status}")
+            if status == "filled":
+                return order
+        except Exception as e:
+            logger.error(f"Limit order error: {e}")
+        return None
+
+    async def execute_market_order(symbol, base_qty, multiplier, place_order_func, order_monitor):
+        try:
+            logger.info("Placing market order")
+            qty = base_qty * (multiplier ** 1)
+            order = await place_order_func(
+                symbol=symbol,
+                side="buy",
+                type="market",
+                size=qty
+            )
+            logger.info(f"Market order placed: {order['order_id']}")
+            status = await order_monitor.wait_for_status(order['order_id'])
+            if status == "filled":
+                return order
+        except Exception as e:
+            logger.error(f"Market order error: {e}")
+        return None
+
+    async def place_next_orders(symbol, success_orders, take_profit_pct, stop_loss_pct, place_order_func):
+        logger.info("Placing TP and SL orders")
+        for order in success_orders:
+            price = Decimal(order['price'])
+            qty = Decimal(order['size'])
+            take_profit_price = float(price * (1 + Decimal(take_profit_pct)))
+            stop_loss_price = float(price * (1 - Decimal(stop_loss_pct)))
+
+            logger.info(f"TP: {take_profit_price}, SL: {stop_loss_price}, qty: {qty}")
+
+            await place_order_func(
+                symbol=symbol,
+                side="sell",
+                type="limit",
+                price=take_profit_price,
+                size=qty
+            )
+            await place_order_func(
+                symbol=symbol,
+                side="sell",
+                type="stop_market",
+                stop_price=stop_loss_price,
+                size=qty
+            )
 
 
