@@ -174,7 +174,16 @@ def get_open_orders(api_key, secret_key, symbol=None):
     params = {}
     if symbol:
         params["symbol"] = symbol
-    return make_request("GET", endpoint, api_key, secret_key, instruction, params)
+    try:
+        result = make_request("GET", endpoint, api_key, secret_key, instruction, params)
+        if result is None:
+            logger.warning("get_open_orders 回傳為 None")
+        return result
+    except requests.exceptions.HTTPError as err:
+        logger.error(f"HTTP 錯誤發生: {err}")
+    except Exception as err:
+        logger.error(f"發生未知錯誤: {err}")
+    return None
 
 def cancel_all_orders(api_key, secret_key, symbol):
     """取消所有訂單"""
