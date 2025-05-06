@@ -2,6 +2,8 @@
 馬丁策略模塊
 """
 import time
+import requests
+import json
 import threading
 import logging
 import math
@@ -586,7 +588,7 @@ class MartingaleLongTrader:
         logger.debug(f"[DEBUG] order_details ready to sign: {order_details}")
 
         try:
-            result = await self.client.place_order(order_details)
+            result = await place_order(order_details)
             logger.debug(f"[DEBUG] Order placed result: {result}")
             return result
         except Exception as e:
@@ -911,14 +913,24 @@ class MartingaleLongTrader:
         
 
         # 初始化 entry_price
-        if self.entry_type in ("offset", "market"):
-            ticker = await self.client.get_ticker(self.symbol)
-            self.entry_price = float(ticker["price"])
-        elif self.entry_type == "manual":
-            if self.entry_price is None:
-                raise ValueError("manual entry requires --entry-price")
-        else:
-            raise ValueError(f"Unsupported entry_type: {self.entry_type}")
+        try:
+            if self.entry_type in ("offset", "market"):
+                ticker = get_ticker(self.symbol)  # 自動 fallback
+                if "price" in ticker:
+                    self.entry_price = float(ticker["price"])
+                else:
+                    raise ValueError("無法從 ticker 資料中取得價格資訊")
+            
+            elif self.entry_type == "manual":
+                if self.entry_price is None:
+                    raise ValueError("manual entry requires --entry-price")
+                logger.info(f"[manual] 使用手動 entry_price = {self.entry_price}")
+            
+            else:
+                raise ValueError(f"Unsupported entry_type: {self.entry_type}")
+        except Exception as e:
+            logger.error(f"初始化 entry_price 失敗: {e}")
+            raise
 
         # ✅ 一次掛好所有層數的馬丁單（包含首單）
         await self.place_martingale_orders(
