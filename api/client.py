@@ -12,7 +12,7 @@ from logger import setup_logger
 logger = setup_logger("api.client")
 
 def make_request(method: str, endpoint: str, api_key=None, secret_key=None, instruction=None, 
-                 params=None, data=None, retry_count=3) -> Dict:
+                 params=None, data=None, retry_count=3, headers=None) -> Dict:
     """
     執行API請求，支持重試機制
     
