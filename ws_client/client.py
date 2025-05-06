@@ -1,295 +1,615 @@
 """
-API請求客戶端模塊
+WebSocket客户端模塊
 """
 import json
 import time
-import requests
-from typing import Dict, Any, Optional, List, Union
-from .auth import create_signature
-from config import API_URL, API_VERSION, DEFAULT_WINDOW
+import threading
+import websocket as ws
+from typing import Dict, List, Tuple, Any, Optional, Callable
+from config import WS_URL, DEFAULT_WINDOW
+from api.auth import create_signature
+from api.client import get_order_book
+from utils.helpers import calculate_volatility
 from logger import setup_logger
 
-logger = setup_logger("api.client")
 
-def make_request(method: str, endpoint: str, api_key=None, secret_key=None, instruction=None, 
-                 params=None, data=None, retry_count=3) -> Dict:
-    """
-    執行API請求，支持重試機制
-    
-    Args:
-        method: HTTP方法 (GET, POST, DELETE)
-        endpoint: API端點
-        api_key: API密鑰
-        secret_key: API密鑰
-        instruction: API指令
-        params: 查詢參數
-        data: 請求體數據
-        retry_count: 重試次數
+logger = setup_logger("backpack_ws")
+
+class BackpackWebSocket:
+    def __init__(self, api_key, secret_key, symbol,strategy, on_message_callback=None, auto_reconnect=True, proxy=None):
+        """
+        初始化WebSocket客户端
         
-    Returns:
-        API響應數據
-    """
-    url = f"{API_URL}{endpoint}"
-    headers = {'Content-Type': 'application/json'}
-    
-    # 構建簽名信息（如需要）
-    if api_key and secret_key and instruction:
-        timestamp = str(int(time.time() * 1000))
-        window = DEFAULT_WINDOW
+        Args:
+            api_key: API密鑰
+            secret_key: API密鑰
+            symbol: 交易對符號
+            on_message_callback: 消息回調函數
+            auto_reconnect: 是否自動重連
+            proxy:  wss代理 支持格式为 http://user:pass@host:port/ 或者 http://host:port
+
+        """
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.symbol = symbol.upper().replace('-', '_')
+        self.strategy = strategy
+        self.ws = None
+        self.on_message_callback = on_message_callback
+        self.connected = False
+        self.last_price = None
+        self.bid_price = None
+        self.ask_price = None
+        self.orderbook = {"bids": [], "asks": []}
+        self.order_updates = []
+        self.historical_prices = []  # 儲存歷史價格用於計算波動率
+        self.max_price_history = 100  # 最多儲存的價格數量
+        self.price = None
+        self.subscribe(f"account.orderUpdate.{self.symbol}")
+
+        # 重連相關參數
+        self.auto_reconnect = auto_reconnect
+        self.reconnect_delay = 1
+        self.max_reconnect_delay = 30
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 10
+        self.running = False
+        self.ws_thread = None
         
-        # 構建簽名消息
-        query_string = ""
-        if params:
-            sorted_params = sorted(params.items())
-            query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
+        # 記錄已訂閲的頻道
+        self.subscriptions = []
         
-        sign_message = f"instruction={instruction}"
-        if query_string:
-            sign_message += f"&{query_string}"
-        sign_message += f"&timestamp={timestamp}&window={window}"
+        # 添加WebSocket執行緒鎖
+        self.ws_lock = threading.Lock()
         
-        signature = create_signature(secret_key, sign_message)
-        if not signature:
-            return {"error": "簽名創建失敗"}
-        
-        headers.update({
-            'X-API-KEY': api_key,
-            'X-SIGNATURE': signature,
-            'X-TIMESTAMP': timestamp,
-            'X-WINDOW': window
-        })
-    
-    # 添加查詢參數到URL
-    if params and method.upper() in ['GET', 'DELETE']:
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-        url += f"?{query_string}"
-    
-    # 實施重試機制
-    for attempt in range(retry_count):
+        # 添加心跳檢測
+        self.last_heartbeat = time.time()
+        self.heartbeat_interval = 30
+        self.heartbeat_thread = None
+
+        # 添加代理参数
+        self.proxy = proxy
+
+    def initialize_orderbook(self):
+        """佔位函數（或用於未來擴展）"""
         try:
-            if method.upper() == 'GET':
-                response = requests.get(url, headers=headers, timeout=10)
-            elif method.upper() == 'POST':
-                response = requests.post(url, headers=headers, data=json.dumps(data) if data else None, timeout=10)
-            elif method.upper() == 'DELETE':
-                response = requests.delete(url, headers=headers, data=json.dumps(data) if data else None, timeout=10)
-            else:
-                return {"error": f"不支持的請求方法: {method}"}
+            # 使用REST API獲取完整訂單簿
+            order_book = get_order_book(self.symbol, 100)  # 增加深度
+            if isinstance(order_book, dict) and "error" in order_book:
+                logger.error(f"初始化訂單簿失敗: {order_book['error']}")
+                return False
             
-            # 處理響應
-            if response.status_code in [200, 201]:
-                return response.json() if response.text.strip() else {}
-            elif response.status_code == 429:  # 速率限制
-                wait_time = 1 * (2 ** attempt)  # 指數退避
-                logger.warning(f"遇到速率限制，等待 {wait_time} 秒後重試")
-                time.sleep(wait_time)
-                continue
-            else:
-                error_msg = f"狀態碼: {response.status_code}, 消息: {response.text}"
-                if attempt < retry_count - 1:
-                    logger.warning(f"請求失敗 ({attempt+1}/{retry_count}): {error_msg}")
-                    time.sleep(1)  # 簡單重試延遲
-                    continue
-                return {"error": error_msg}
+            # 重置並填充orderbook數據結構
+            self.orderbook = {
+                "bids": [[float(price), float(quantity)] for price, quantity in order_book.get('bids', [])],
+                "asks": [[float(price), float(quantity)] for price, quantity in order_book.get('asks', [])]
+            }
+            
+            # 按價格排序
+            self.orderbook["bids"] = sorted(self.orderbook["bids"], key=lambda x: x[0], reverse=True)
+            self.orderbook["asks"] = sorted(self.orderbook["asks"], key=lambda x: x[0])
+            
+            logger.info(f"訂單簿初始化成功: {len(self.orderbook['bids'])} 個買單, {len(self.orderbook['asks'])} 個賣單")
+            return True
+        except Exception as e:                
+            logger.info("📄 跳過初始化訂單簿（馬丁策略不使用）")
+            return False
         
-        except requests.exceptions.Timeout:
-            if attempt < retry_count - 1:
-                logger.warning(f"請求超時 ({attempt+1}/{retry_count})，重試中...")
-                continue
-            return {"error": "請求超時"}
-        except requests.exceptions.ConnectionError:
-            if attempt < retry_count - 1:
-                logger.warning(f"連接錯誤 ({attempt+1}/{retry_count})，重試中...")
-                time.sleep(2)  # 連接錯誤通常需要更長等待
-                continue
-            return {"error": "連接錯誤"}
+    def subscribe(self, stream: str):
+        """发送WebSocket订阅请求"""
+        if not self.connected:
+            logger.warning("WebSocket未连接，无法订阅")
+            return
+        
+        # 构建订阅消息
+        subscribe_msg = {
+            "method": "SUBSCRIBE",
+            "params": [stream],
+            "id": int(time.time()*1000)
+        }
+        self.ws.send(json.dumps(subscribe_msg))
+        logger.debug(f"已订阅频道: {stream}")
+    
+    def add_price_to_history(self, price):
+        """添加價格到歷史記錄用於計算波動率"""
+        if price:
+            self.historical_prices.append(price)
+            # 保持歷史記錄在設定長度內
+            if len(self.historical_prices) > self.max_price_history:
+                self.historical_prices = self.historical_prices[-self.max_price_history:]
+    
+    def get_volatility(self, window=20):
+        """獲取當前波動率"""
+        return calculate_volatility(self.historical_prices, window)
+    
+    def start_heartbeat(self):
+        """開始心跳檢測線程"""
+        if self.heartbeat_thread is None or not self.heartbeat_thread.is_alive():
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat_check, daemon=True)
+            self.heartbeat_thread.start()
+    
+    def _heartbeat_check(self):
+        """定期檢查WebSocket連接狀態並在需要時重連"""
+        while self.running:
+            current_time = time.time()
+            time_since_last_heartbeat = current_time - self.last_heartbeat
+            
+            if time_since_last_heartbeat > self.heartbeat_interval * 2:
+                logger.warning(f"心跳檢測超時 ({time_since_last_heartbeat:.1f}秒)，嘗試重新連接")
+                self.reconnect()
+                
+            time.sleep(5)  # 每5秒檢查一次
+        
+    def connect(self):
+        """建立WebSocket連接"""
+        with self.ws_lock:
+            self.running = True
+            self.reconnect_attempts = 0
+            ws.enableTrace(False)  # 使用 ws.enableTrace 而不是 websocket.enableTrace
+            self.ws = ws.WebSocketApp(  # 同樣使用 ws.WebSocketApp
+                WS_URL,
+                on_open=self.on_open,
+                on_message=self.on_message,
+                on_error=self.on_error,
+                on_close=self.on_close,
+                on_ping=self.on_ping,
+                on_pong=self.on_pong
+            )
+            self.ws_thread = threading.Thread(target=self.ws_run_forever)
+            self.ws_thread.daemon = True
+            self.ws_thread.start()
+            
+            # 啟動心跳檢測
+            self.start_heartbeat()
+    
+    def ws_run_forever(self):
+        try:
+            # 確保在運行前檢查socket狀態
+            if hasattr(self.ws, 'sock') and self.ws.sock and self.ws.sock.connected:
+                logger.debug("發現socket已經打開，跳過run_forever")
+                return
+
+            proxy_type=None
+            http_proxy_auth=None
+            http_proxy_host=None
+            http_proxy_port=None
+            if self.proxy and 3<=len(self.proxy.split(":"))<=4:
+                arrs=self.proxy.split(":")
+                proxy_type = arrs[0]
+                arrs[1]=arrs[1][2:] #去掉 //
+                if len(arrs)==3:
+                    http_proxy_host = arrs[1]
+                else:
+                    password,http_proxy_host = arrs[2].split("@")
+                    http_proxy_auth=(arrs[1],password)
+                http_proxy_port = arrs[-1]
+
+            # 添加ping_interval和ping_timeout參數
+            self.ws.run_forever(ping_interval=self.heartbeat_interval, ping_timeout=10, http_proxy_auth=http_proxy_auth, http_proxy_host=http_proxy_host, http_proxy_port=http_proxy_port, proxy_type=proxy_type)
+
         except Exception as e:
-            if attempt < retry_count - 1:
-                logger.warning(f"請求異常 ({attempt+1}/{retry_count}): {str(e)}，重試中...")
-                continue
-            return {"error": f"請求失敗: {str(e)}"}
+            logger.error(f"WebSocket運行時出錯: {e}")
+        finally:
+            with self.ws_lock:
+                if self.running and self.auto_reconnect and not self.connected:
+                    self.reconnect()
     
-    return {"error": "達到最大重試次數"}
-
-# 各API端點函數
-def get_deposit_address(api_key, secret_key, blockchain):
-    """獲取存款地址"""
-    endpoint = f"/wapi/{API_VERSION}/capital/deposit/address"
-    instruction = "depositAddressQuery"
-    params = {"blockchain": blockchain}
-    return make_request("GET", endpoint, api_key, secret_key, instruction, params)
-
-def get_balance(api_key, secret_key):
-    """獲取賬戶餘額"""
-    endpoint = f"/api/{API_VERSION}/capital"
-    instruction = "balanceQuery"
-    return make_request("GET", endpoint, api_key, secret_key, instruction)
-
-def execute_order(api_key, secret_key, order_details):
-    """執行訂單"""
-    endpoint = f"/api/{API_VERSION}/order"
-    instruction = "orderExecute"
-    
-    method = "POST"
-    
-    
-    # 提取所有參數用於簽名
-    params = {
-        "symbol": order_details["symbol"],
-        "side": order_details["side"],
-        "orderType": order_details["orderType"],
-    }
-
-    if order_details["orderType"] == "Market":
-        # 市價單，只帶 quoteQuantity
-        params["quoteQuantity"] = order_details["quoteQuantity"]
+    def on_pong(self, ws, message):
+        """處理pong響應"""
+        self.last_heartbeat = time.time()
         
-    else:
-        # 限價單，帶 price, quantity, timeInForce, postOnly
-        params["price"] = order_details.get("price", "0")
-        params["quantity"] = order_details["quantity"]
-        params["timeInForce"] = order_details.get("timeInForce", "GTC")
-        params["postOnly"] = str(order_details.get("postOnly", False)).lower()
+    def reconnect(self):
+        """完全斷開並重新建立WebSocket連接"""
+        with self.ws_lock:
+            if not self.running or self.reconnect_attempts >= self.max_reconnect_attempts:
+                logger.warning(f"重連次數超過上限 ({self.max_reconnect_attempts})，停止重連")
+                return False
+
+            self.reconnect_attempts += 1
+            delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), self.max_reconnect_delay)
+            
+            logger.info(f"嘗試第 {self.reconnect_attempts} 次重連，等待 {delay} 秒...")
+            time.sleep(delay)
+            
+            # 確保完全斷開連接前先標記連接狀態
+            self.connected = False
+            
+            # 完全斷開並清理之前的WebSocket連接
+            if self.ws:
+                try:
+                    # 顯式設置內部標記表明這是用户主動關閉
+                    if hasattr(self.ws, '_closed_by_me'):
+                        self.ws._closed_by_me = True
+                    
+                    # 關閉WebSocket
+                    self.ws.close()
+                    self.ws.keep_running = False
+                    
+                    # 強制關閉socket
+                    if hasattr(self.ws, 'sock') and self.ws.sock:
+                        self.ws.sock.close()
+                        self.ws.sock = None
+                except Exception as e:
+                    logger.error(f"關閉之前的WebSocket連接時出錯: {e}")
+                
+                # 給系統更多時間完全關閉連接
+                time.sleep(1.0)  # 增加等待時間
+                self.ws = None
+                
+            # 確保舊的線程已終止
+            if self.ws_thread and self.ws_thread.is_alive():
+                try:
+                    # 更長的超時等待線程終止
+                    self.ws_thread.join(timeout=2)
+                except Exception as e:
+                    logger.error(f"等待舊線程終止時出錯: {e}")
+            
+            # 重置所有相關狀態
+            self.ws_thread = None
+            self.subscriptions = []  # 清空訂閲列表，以便重新訂閲
+            
+            # 創建全新的WebSocket連接
+            ws.enableTrace(False)
+            self.ws = ws.WebSocketApp(
+                WS_URL,
+                on_open=self.on_open,
+                on_message=self.on_message,
+                on_error=self.on_error,
+                on_close=self.on_close,
+                on_ping=self.on_ping,
+                on_pong=self.on_pong
+            )
+            
+            # 創建新線程
+            self.ws_thread = threading.Thread(target=self.ws_run_forever)
+            self.ws_thread.daemon = True
+            self.ws_thread.start()
+            
+            # 更新最後心跳時間，避免重連後立即觸發心跳檢測
+            self.last_heartbeat = time.time()
+            
+            return True
         
-
-    # 添加可選參數
-    for key in ["reduceOnly", "clientId", "autoBorrow", "autoLendRedeem", "autoBorrowRepay", "autoLend"]:
-        if key in order_details and key not in params:
-            value = order_details[key]
-            params[key] = str(value).lower() if isinstance(value, bool) else str(value)
-
-    print(f"make_request 現在是：{make_request}")
-    print(f"make_request 類型：{type(make_request)}")
-    
-    print(f"[DEBUG] order_details ready to sign: {params}")
-    print("[DEBUG] Payload:", order_details)
-
-    # 直接呼叫 make_request，不再自己組 URL
-    return make_request(method, endpoint, api_key, secret_key, instruction, params, order_details)
-
-def get_open_orders(api_key, secret_key, symbol=None):
-    """獲取未成交訂單"""
-    endpoint = f"/api/{API_VERSION}/orders"
-    instruction = "orderQueryAll"
-    params = {}
-    if symbol:
-        params["symbol"] = symbol
-    try:
-        result = make_request("GET", endpoint, api_key, secret_key, instruction, params)
-        if result is None:
-            logger.warning("get_open_orders 回傳為 None")
-        return result
-    except requests.exceptions.HTTPError as err:
-        logger.error(f"HTTP 錯誤發生: {err}")
-    except Exception as err:
-        logger.error(f"發生未知錯誤: {err}")
-    return None
-
-def cancel_all_orders(api_key, secret_key, symbol):
-    """取消所有訂單"""
-    endpoint = f"/api/{API_VERSION}/orders"
-    instruction = "orderCancelAll"
-    params = {"symbol": symbol}
-    data = {"symbol": symbol}
-    return make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
-
-def cancel_order(api_key, secret_key, order_id, symbol):
-    """取消指定訂單"""
-    endpoint = f"/api/{API_VERSION}/order"
-    instruction = "orderCancel"
-    params = {"orderId": order_id, "symbol": symbol}
-    data = {"orderId": order_id, "symbol": symbol}
-    return make_request("DELETE", endpoint, api_key, secret_key, instruction, params, data)
-
-def get_ticker(symbol):
-    """獲取市場價格"""
-    endpoint = f"/api/{API_VERSION}/ticker"
-    params = {"symbol": symbol}
-    return make_request("GET", endpoint, params=params)
-
-def get_markets():
-    """獲取所有交易對信息"""
-    endpoint = f"/api/{API_VERSION}/markets"
-    return make_request("GET", endpoint)
-
-def get_order_book(symbol, limit=20):
-    """獲取市場深度"""
-    endpoint = f"/api/{API_VERSION}/depth"
-    params = {"symbol": symbol, "limit": str(limit)}
-    return make_request("GET", endpoint, params=params)
-
-def get_fill_history(api_key, secret_key, symbol=None, limit=100):
-    """獲取歷史成交記錄"""
-    endpoint = f"/wapi/{API_VERSION}/history/fills"
-    instruction = "fillHistoryQueryAll"
-    params = {"limit": str(limit)}
-    if symbol:
-        params["symbol"] = symbol
-    return make_request("GET", endpoint, api_key, secret_key, instruction, params)
-
-def get_klines(symbol, interval="1h", limit=100):
-    """獲取K線數據"""
-    endpoint = f"/api/{API_VERSION}/klines"
-    
-    # 計算起始時間 (秒)
-    current_time = int(time.time())
-    
-    # 各間隔對應的秒數
-    interval_seconds = {
-        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
-        "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800,
-        "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800, "1month": 2592000
-    }
-    
-    # 計算合適的起始時間
-    duration = interval_seconds.get(interval, 3600)
-    start_time = current_time - (duration * limit)
-    
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "startTime": str(start_time)
-    }
-    
-    return make_request("GET", endpoint, params=params)
-
-def get_market_limits(symbol):
-    """獲取交易對的最低訂單量和價格精度"""
-    markets_info = get_markets()
-    
-    if not isinstance(markets_info, dict) and isinstance(markets_info, list):
-        for market_info in markets_info:
-            if market_info.get('symbol') == symbol:
-                base_asset = market_info.get('baseSymbol')
-                quote_asset = market_info.get('quoteSymbol')
-                
-                # 從filters中獲取精度和最小訂單量信息
-                filters = market_info.get('filters', {})
-                base_precision = 8  # 默認值
-                quote_precision = 8  # 默認值
-                min_order_size = "0"  # 默認值
-                tick_size = "0.00000001"  # 默認值
-                
-                if 'price' in filters:
-                    tick_size = filters['price'].get('tickSize', '0.00000001')
-                    quote_precision = len(tick_size.split('.')[-1]) if '.' in tick_size else 0
-                
-                if 'quantity' in filters:
-                    min_order_size = filters['quantity'].get('minQuantity', '0')
-                    min_value = filters['quantity'].get('minQuantity', '0.00000001')
-                    base_precision = len(min_value.split('.')[-1]) if '.' in min_value else 0
-                
-                return {
-                    'base_asset': base_asset,
-                    'quote_asset': quote_asset,
-                    'base_precision': base_precision,
-                    'quote_precision': quote_precision,
-                    'min_order_size': min_order_size,
-                    'tick_size': tick_size
-                }
+    def on_ping(self, ws, message):
+        """處理ping消息"""
+        try:
+            self.last_heartbeat = time.time()
+            if ws and hasattr(ws, 'sock') and ws.sock:
+                ws.sock.pong(message)
+            else:
+                logger.debug("無法迴應ping：WebSocket或sock為None")
+        except Exception as e:
+            logger.debug(f"迴應ping失敗: {e}")
         
-        logger.error(f"找不到交易對 {symbol} 的信息")
-        return None
-    else:
-        logger.error(f"無法獲取交易對信息: {markets_info}")
-        return None
+    def on_open(self, ws):
+        """WebSocket打開時的處理"""
+        logger.info("WebSocket連接已建立")
+        self.connected = True
+        self.subscribe(f"account.orderUpdate.{self.symbol}")
+        self.subscribe(f"bookTicker.{self.symbol}")
+        self.reconnect_attempts = 0
+        self.last_heartbeat = time.time()
+        
+        # 添加短暫延遲確保連接穩定
+        time.sleep(0.5)
+        
+        # 初始化訂單簿
+        orderbook_initialized = self.initialize_orderbook()
+        
+        # 如果初始化成功，訂閲深度和行情數據
+        if orderbook_initialized:
+            if "bookTicker" in self.subscriptions or not self.subscriptions:
+                self.subscribe_bookTicker()
+            
+            
+        
+        # 重新訂閲私有訂單更新流
+        for sub in self.subscriptions:
+            if sub.startswith("account."):
+                self.private_subscribe(sub)
+    
+    def subscribe_bookTicker(self):
+        """訂閲最優價格"""
+        logger.info(f"訂閲 {self.symbol} 的bookTicker...")
+        if not self.connected or not self.ws:
+            logger.warning("WebSocket未連接，無法訂閲bookTicker")
+            return False
+            
+        try:
+            message = {
+                "method": "SUBSCRIBE",
+                "params": [f"bookTicker.{self.symbol}"]
+            }
+            self.ws.send(json.dumps(message))
+            if "bookTicker" not in self.subscriptions:
+                self.subscriptions.append("bookTicker")
+            return True
+        except Exception as e:
+            logger.error(f"訂閲bookTicker失敗: {e}")
+            return False
+    
+        
+    def private_subscribe(self, stream: str) -> bool:
+        """訂閱私有數據流 (需簽名驗證)"""
+        if not self.connected or not self.ws:
+            logger.warning("WebSocket未連接，無法訂閱私有流")
+            return False
+
+        try:
+            timestamp = str(int(time.time() * 1000))
+            window = DEFAULT_WINDOW
+            message_to_sign = f"instruction=subscribe&timestamp={timestamp}&window={window}"
+            signature = create_signature(self.secret_key, message_to_sign)
+
+            if not signature:
+                logger.error("❌ 簽名創建失敗，無法訂閱私有流")
+                return False
+
+            payload = {
+                "method": "SUBSCRIBE",
+                "params": [stream],
+                "signature": [self.api_key, signature, timestamp, window]
+            }
+
+            self.ws.send(json.dumps(payload))
+            logger.info(f"✅ 已訂閱私有數據流: {stream}")
+
+            if stream not in self.subscriptions:
+                self.subscriptions.append(stream)
+
+            return True
+        except Exception as e:
+            logger.error(f"❌ 訂閱私有數據流失敗: {e}")
+            return False
+    
+    def on_message(self, ws, message):
+        """處理WebSocket消息"""
+        try:
+            data = json.loads(message)
+            
+            # ✅ Ping/Pong 心跳處理
+            if isinstance(data, dict) and data.get("ping"):
+                pong_message = {"pong": data.get("ping")}
+                if self.ws and self.connected:
+                    self.ws.send(json.dumps(pong_message))
+                    self.last_heartbeat = time.time()
+                return
+
+            # ✅ 核心資料流處理
+            if "stream" in data and "data" in data:
+                stream = data["stream"]
+                event_data = data["data"]
+
+                # 🟢 訂單更新
+                if stream.startswith("account.orderUpdate."):
+                    if self.strategy:
+                        self.strategy.on_order_update(event_data)  # 策略邏輯處理
+                    self.order_updates.append(event_data)
+
+                # 🟢 支援 orderFill（成交）訊息
+                elif stream.startswith("account.orderFill."):
+                    if self.strategy:
+                        self.strategy.on_order_filled(event_data)
+
+                # 🟢 bookTicker 價格更新
+                elif stream.startswith("bookTicker."):
+                    if 'b' in event_data and 'a' in event_data:
+                        self.bid_price = float(event_data['b'])
+                        self.ask_price = float(event_data['a'])
+                        self.last_price = (self.bid_price + self.ask_price) / 2
+                        self.add_price_to_history(self.last_price)
+
+                # 🟢 深度數據
+                elif stream.startswith("depth."):
+                    if 'b' in event_data and 'a' in event_data:
+                        self._update_orderbook(event_data)
+
+                # ✅ 通用 callback
+                if self.on_message_callback:
+                    self.on_message_callback(stream, event_data)
+
+            else:
+                logger.warning(f"未知格式 WebSocket 訊息: {data}")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON 解碼錯誤: {e}")
+        except Exception as e:
+            logger.error(f"處理 WebSocket 訊息時發生錯誤: {e},原始訊息: {message}")
+        
+    def _update_orderbook(self, data):
+        """更新訂單簿（優化處理速度）"""
+        # 處理買單更新
+        if 'b' in data:
+            for bid in data['b']:
+                price = float(bid[0])
+                quantity = float(bid[1])
+                
+                # 使用二分查找來優化插入位置查找
+                if quantity == 0:
+                    # 移除價位
+                    self.orderbook["bids"] = [b for b in self.orderbook["bids"] if b[0] != price]
+                else:
+                    # 先查找是否存在相同價位
+                    found = False
+                    for i, b in enumerate(self.orderbook["bids"]):
+                        if b[0] == price:
+                            self.orderbook["bids"][i] = [price, quantity]
+                            found = True
+                            break
+                    
+                    # 如果不存在，插入並保持排序
+                    if not found:
+                        self.orderbook["bids"].append([price, quantity])
+                        # 按價格降序排序
+                        self.orderbook["bids"] = sorted(self.orderbook["bids"], key=lambda x: x[0], reverse=True)
+        
+        # 處理賣單更新
+        if 'a' in data:
+            for ask in data['a']:
+                price = float(ask[0])
+                quantity = float(ask[1])
+                
+                if quantity == 0:
+                    # 移除價位
+                    self.orderbook["asks"] = [a for a in self.orderbook["asks"] if a[0] != price]
+                else:
+                    # 先查找是否存在相同價位
+                    found = False
+                    for i, a in enumerate(self.orderbook["asks"]):
+                        if a[0] == price:
+                            self.orderbook["asks"][i] = [price, quantity]
+                            found = True
+                            break
+                    
+                    # 如果不存在，插入並保持排序
+                    if not found:
+                        self.orderbook["asks"].append([price, quantity])
+                        # 按價格升序排序
+                        self.orderbook["asks"] = sorted(self.orderbook["asks"], key=lambda x: x[0])
+    
+    def on_error(self, ws, error):
+        """處理WebSocket錯誤"""
+        logger.error(f"WebSocket發生錯誤: {error}")
+        self.last_heartbeat = 0  # 強制觸發重連
+    
+    def on_close(self, ws, close_status_code, close_msg):
+        """處理WebSocket關閉"""
+        previous_connected = self.connected
+        self.connected = False
+        logger.info(f"WebSocket連接已關閉: {close_msg if close_msg else 'No message'} (狀態碼: {close_status_code if close_status_code else 'None'})")
+        
+        # 清理當前socket資源
+        if hasattr(ws, 'sock') and ws.sock:
+            try:
+                ws.sock.close()
+                ws.sock = None
+            except Exception as e:
+                logger.debug(f"關閉socket時出錯: {e}")
+        
+        if close_status_code == 1000 or getattr(ws, '_closed_by_me', False):
+            logger.info("WebSocket正常關閉，不進行重連")
+        elif previous_connected and self.running and self.auto_reconnect:
+            logger.info("WebSocket非正常關閉，將自動重連")
+            # 使用線程觸發重連，避免在回調中直接重連
+            threading.Thread(target=self.reconnect, daemon=True).start()
+    
+    def close(self):
+        """完全關閉WebSocket連接"""
+        with self.ws_lock:
+            logger.info("主動關閉WebSocket連接...")
+            self.running = False
+            self.connected = False
+            
+            # 停止心跳檢測線程
+            if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+                try:
+                    self.heartbeat_thread.join(timeout=1)
+                except Exception:
+                    pass
+            self.heartbeat_thread = None
+            
+            if self.ws:
+                # 標記為主動關閉
+                if not hasattr(self.ws, '_closed_by_me'):
+                    self.ws._closed_by_me = True
+                else:
+                    self.ws._closed_by_me = True
+                    
+                try:
+                    # 關閉WebSocket
+                    self.ws.close()
+                    self.ws.keep_running = False
+                    
+                    # 強制關閉socket
+                    if hasattr(self.ws, 'sock') and self.ws.sock:
+                        self.ws.sock.close()
+                except Exception as e:
+                    logger.error(f"關閉WebSocket時出錯: {e}")
+                
+                # 等待完全關閉
+                time.sleep(0.5)
+                self.ws = None
+            
+            # 清理線程
+            if self.ws_thread and self.ws_thread.is_alive():
+                try:
+                    self.ws_thread.join(timeout=1)
+                except Exception:
+                    pass
+            self.ws_thread = None
+            
+            # 重置訂閲狀態
+            self.subscriptions = []
+            
+            logger.info("WebSocket連接已完全關閉")
+    
+    def get_current_price(self):
+        """獲取當前價格"""
+        return self.last_price
+    
+    def get_bid_ask(self):
+        """獲取買賣價"""
+        return self.bid_price, self.ask_price
+    
+    def get_orderbook(self):
+        """獲取訂單簿"""
+        return self.orderbook
+
+    def is_connected(self):
+        """檢查連接狀態"""
+        if not self.connected:
+            return False
+        if not self.ws:
+            return False
+        if not hasattr(self.ws, 'sock') or not self.ws.sock:
+            return False
+        
+        # 檢查socket是否連接
+        try:
+            return self.ws.sock.connected
+        except:
+            return False
+    
+    def get_liquidity_profile(self, depth_percentage=0.01):
+        """分析市場流動性特徵"""
+        if not self.orderbook["bids"] or not self.orderbook["asks"]:
+            return None
+        
+        mid_price = (self.bid_price + self.ask_price) / 2 if self.bid_price and self.ask_price else None
+        if not mid_price:
+            return None
+        
+        # 計算價格範圍
+        min_price = mid_price * (1 - depth_percentage)
+        max_price = mid_price * (1 + depth_percentage)
+        
+        # 分析買賣單流動性
+        bid_volume = sum(qty for price, qty in self.orderbook["bids"] if price >= min_price)
+        ask_volume = sum(qty for price, qty in self.orderbook["asks"] if price <= max_price)
+        
+        # 計算買賣比例
+        ratio = bid_volume / ask_volume if ask_volume > 0 else float('inf')
+        
+        # 買賣壓力差異
+        imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume) if (bid_volume + ask_volume) > 0 else 0
+        
+        return {
+            'bid_volume': bid_volume,
+            'ask_volume': ask_volume,
+            'volume_ratio': ratio,
+            'imbalance': imbalance,
+            'mid_price': mid_price
+        }
+    
+    def on_order_update(self, data):
+        """處理訂單成交事件"""
+        if data.get('e') == 'orderFill':
+            order_id = data['i']
+            filled_qty = float(data['l'])
+            price = float(data['L'])
+            
+            # 更新策略狀態
+            self.strategy.handle_order_fill(order_id, filled_qty, price)
+            
+            # 觸發後續掛單
+            if self.strategy.current_layer < self.strategy.max_layers:
+                self.strategy.place_martingale_orders(price)
