@@ -916,10 +916,12 @@ class MartingaleLongTrader:
         try:
             if self.entry_type in ("offset", "market"):
                 ticker = get_ticker(self.symbol)  # 自動 fallback
-                if "price" in ticker:
+                if "lastPrice" in ticker:
+                    self.entry_price = float(ticker["lastPrice"])
+                elif "price" in ticker:
                     self.entry_price = float(ticker["price"])
                 else:
-                    raise ValueError("無法從 ticker 資料中取得價格資訊")
+                    raise ValueError(f"ticker 資料中缺少價格欄位: {ticker}")
             
             elif self.entry_type == "manual":
                 if self.entry_price is None:
