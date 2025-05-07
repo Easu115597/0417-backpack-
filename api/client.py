@@ -205,7 +205,9 @@ def get_ticker(symbol):
     """獲取市場價格"""
     endpoint = f"/api/{API_VERSION}/ticker"
     params = {"symbol": symbol}
-    return make_request("GET", endpoint, params=params)
+    result = make_request("GET", endpoint, params=params)
+    print("[DEBUG] get_ticker 回傳結果:", result)
+    return result
 
 def get_markets():
     """獲取所有交易對信息"""
