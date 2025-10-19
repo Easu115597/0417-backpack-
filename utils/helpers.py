@@ -4,6 +4,27 @@
 import math
 import numpy as np
 from typing import List, Union, Optional
+import os
+import time
+import hmac
+import hashlib
+import base64
+
+def get_headers():
+    api_key = os.getenv("API_KEY")
+    secret_key = os.getenv("SECRET_KEY")
+    timestamp = str(int(time.time() * 1000))
+    message = f"{timestamp}"
+    signature = base64.b64encode(
+        hmac.new(secret_key.encode(), message.encode(), hashlib.sha256).digest()
+    ).decode()
+
+    return {
+        "BP-API-KEY": api_key,
+        "BP-API-TIMESTAMP": timestamp,
+        "BP-API-SIGNATURE": signature,
+        "Content-Type": "application/json",
+    }
 
 def round_to_precision(value: float, precision: int) -> float:
     """
