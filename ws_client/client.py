@@ -214,3 +214,25 @@ class BackpackWebSocketClient:
                 ]
             }
             
+            self.logger.debug(f"訂閱數據: {json.dumps({**subscription_data, 'signature': [self.api_key, 'SIGNATURE', timestamp, window]})}")
+            
+            if self.ws:
+                await self.ws.send(json.dumps(subscription_data))
+                self.subscriptions.append({"channel": "account.orderUpdate", "symbols": [self.symbol]})
+                self.logger.info(f"已訂閱: account.orderUpdate")
+                return True
+            else:
+                self.logger.error("WebSocket未連接，無法發送訂閱請求")
+                return False
+        except Exception as e:
+            self.logger.error(f"訂閱賬戶更新失敗: {e}", exc_info=True)
+            return False
+    
+    def on(self, channel, callback):
+        """註冊頻道數據的回調函數"""
+        self.callbacks[channel] = callback
+        self.logger.info(f"已註冊 {channel} 頻道的回調函數")
+        
+    def is_connected(self):
+        """檢查WebSocket是否已連接"""
+        return self.connected and self.ws and self.ws.open
